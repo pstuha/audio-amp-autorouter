@@ -1,0 +1,115 @@
+{
+  "board_name": "unknown",
+  "current_loops": [
+    {
+      "net_name": "GND",
+      "area_mm2": 746.25,
+      "centroid": [
+        46.09027777777778,
+        20.333333333333332
+      ],
+      "inductance_nh": 14.552502263301994,
+      "perimeter_mm": 1637.7549071309732,
+      "critical": true
+    },
+    {
+      "net_name": "MID",
+      "area_mm2": 168.75,
+      "centroid": [
+        28.5,
+        30.0
+      ],
+      "inductance_nh": 49.37620878990882,
+      "perimeter_mm": 106.16441116766372,
+      "critical": false
+    },
+    {
+      "net_name": "IN",
+      "area_mm2": 103.125,
+      "centroid": [
+        10.0,
+        19.583333333333332
+      ],
+      "inductance_nh": 63.09929301033179,
+      "perimeter_mm": 49.09852574512463,
+      "critical": false
+    },
+    {
+      "net_name": "VCC",
+      "area_mm2": 67.5,
+      "centroid": [
+        47.5,
+        18.0
+      ],
+      "inductance_nh": 44.81327800829875,
+      "perimeter_mm": 45.0,
+      "critical": true
+    },
+    {
+      "net_name": "OUT",
+      "area_mm2": 15.3125,
+      "centroid": [
+        55.666666666666664,
+        29.166666666666668
+      ],
+      "inductance_nh": 9.161983812587504,
+      "perimeter_mm": 50.281867030456525,
+      "critical": true
+    }
+  ],
+  "thermal": [],
+  "audio": {
+    "damping_factor": 25.0,
+    "thd_percent": 0.3286,
+    "psrr": {
+      "100hz_pos": 80.0,
+      "1khz_pos": 86.0,
+      "100hz_neg": 74.0,
+      "1khz_neg": 82.0
+    },
+    "slew_rate_v_us": 40.0,
+    "stable_capacitive_load_uF": [
+      1.0,
+      10.0
+    ]
+  },
+  "stability": {
+    "phase_margin_deg": 35.0,
+    "gain_margin_db": 12.0,
+    "unity_gain_freq_mhz": 1.0,
+    "stable": false,
+    "notes": [
+      "Warning: Some compensation caps not found - phase margin may suffer",
+      "Stability may be marginal - review compensation"
+    ]
+  },
+  "ir_drop": {
+    "VCC": 0.002,
+    "GND": 0.023
+  },
+  "recommendations": [
+    "Reduce area of 3 critical current loops (total area: 829.1 mm²)",
+    "Damping factor 25.0 is below ideal (>50). Consider thicker output traces or lower emitter resistance.",
+    "THD estimate 0.3286% is elevated. Review loop areas and decoupling."
+  ],
+  "warnings": [
+    "Phase margin 35° may be insufficient"
+  ],
+  "thermal_heatmap_path": "examples\\thermal_heatmap.png",
+  "thermal_gradient": {
+    "max_gradient_c_per_mm": 0.0,
+    "hottest_component": null,
+    "hot_spots": [],
+    "notes": [
+      "no thermal data"
+    ]
+  },
+  "thermal_coupling": {
+    "count": 0,
+    "critical_pairs": [],
+    "all": []
+  },
+  "loop_map": "examples\\loop_map.png",
+  "df_heatmap": "examples\\df_heatmap.png",
+  "bode": "examples\\bode.png"
+}
