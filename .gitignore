@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+*.log
+_amp_autorouter_logs/
+*.report.json
+*.report.md
+
+examples/*_out.kicad_pcb
+examples/*.report.json
+examples/*.report.md
