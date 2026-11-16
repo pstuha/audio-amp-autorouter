@@ -1,7 +1,6 @@
 //! Geometry primitives for autorouting.
 
 use pyo3::prelude::*;
-use serde::{Deserialize, Serialize};
 
 /// A 2D point in grid coordinates
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -21,7 +20,7 @@ impl Point {
 }
 
 /// Rectangle in mm coordinates
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Rect {
     pub x_min: f64,
     pub y_min: f64,
