@@ -3,8 +3,6 @@ name: Build PyO3 Extension
 on:
   push:
     branches: [main]
-    tags:
-      - 'v*'
   pull_request:
     branches: [main]
 
@@ -25,28 +23,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install Rust
-        if: matrix.platform == 'windows-latest'
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Rust (non-Windows)
-        if: matrix.platform != 'windows-latest'
+      - name: Build Python extension
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-      - name: Build Python extension (Windows)
-        if: matrix.platform == 'windows-latest'
-        run: |
-          $env:Path += ";$env:USERPROFILE\.cargo\bin"
-          cargo build --release --manifest-path amproute_core/Cargo.toml
-          # Copy the .pyd file to the package
-          Copy-Item target/release/*.pyd dist\amproute_core\ -ErrorAction SilentlyContinue
-          Copy-Item target/release/*.dll dist\amproute_core\ -ErrorAction SilentlyContinue
-
-      - name: Build Python extension (non-Windows)
-        if: matrix.platform != 'windows-latest'
-        run: |
-          source $HOME/.cargo/env
           pip install maturin
           maturin build --release --manifest-path amproute_core/Cargo.toml --out dist
 
@@ -78,7 +59,7 @@ jobs:
       - name: Install and test
         run: |
           pip install dist/*.whl
-          python -c "import amproute_core; print(amproute_core.__file__)"
+          python -c "import amproute_core; print('Module loaded:', amproute_core.__file__)"
 
   release:
     needs: build
@@ -95,6 +76,5 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: dist/*.whl
-          draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
