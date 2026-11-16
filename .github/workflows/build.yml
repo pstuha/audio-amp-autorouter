@@ -1,0 +1,100 @@
+name: Build PyO3 Extension
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        platform: [windows-latest, manylinux2014-x86_64, macos-latest]
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        if: matrix.platform == 'windows-latest'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust (non-Windows)
+        if: matrix.platform != 'windows-latest'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+      - name: Build Python extension (Windows)
+        if: matrix.platform == 'windows-latest'
+        run: |
+          $env:Path += ";$env:USERPROFILE\.cargo\bin"
+          cargo build --release --manifest-path amproute_core/Cargo.toml
+          # Copy the .pyd file to the package
+          Copy-Item target/release/*.pyd dist\amproute_core\ -ErrorAction SilentlyContinue
+          Copy-Item target/release/*.dll dist\amproute_core\ -ErrorAction SilentlyContinue
+
+      - name: Build Python extension (non-Windows)
+        if: matrix.platform != 'windows-latest'
+        run: |
+          source $HOME/.cargo/env
+          pip install maturin
+          maturin build --release --manifest-path amproute_core/Cargo.toml --out dist
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform }}-py${{ matrix.python-version }}
+          path: dist/*.whl
+
+  test:
+    needs: build
+    runs-on: windows-latest
+    python-version: '3.12'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Install and test
+        run: |
+          pip install dist/*.whl
+          python -c "import amproute_core; print(amproute_core.__file__)"
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*.whl
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
