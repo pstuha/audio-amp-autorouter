@@ -406,6 +406,8 @@ class Router:
         solution.rip_ups = state.rip_ups
         for net in solution.routed_nets:
             width = state.rul_width(net)
+            if net not in state.paths:
+                continue  # skip if no path was found for this net
             for a, b in state.paths[net]:
                 solution.segments.append(RouteSegment(
                     net, a[0] * state.grid, a[1] * state.grid, b[0] * state.grid, b[1] * state.grid,
