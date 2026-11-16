@@ -90,6 +90,8 @@ class Board:
     bounds_mm: Optional[Tuple[float, float, float, float]] = None
     mounting_holes: List[Tuple[float, float, float]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    segments: List["RouteSegment"] = field(default_factory=list)  # Routing segments
+    vias: List["Via"] = field(default_factory=list)  # Via definitions
 
     def net_names_for(self, ref: str) -> List[str]:
         comp = self.components.get(ref)

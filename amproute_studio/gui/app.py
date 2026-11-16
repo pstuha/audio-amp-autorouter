@@ -557,6 +557,8 @@ class MainWindow(QMainWindow):
             place=self.cb_place.isChecked(),
             route=self.cb_route.isChecked(),
             attempts=self.attempts_spin.value(),
+            sim_aware=self.cb_sim_feedback.isChecked(),
+            sim_attempts=3,
         )
 
         worker = RoutingWorker(self.board, options)
