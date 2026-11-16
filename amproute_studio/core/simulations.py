@@ -75,6 +75,40 @@ class StabilityAnalysis:
 
 
 @dataclass
+class CrosstalkResult:
+    """Result of crosstalk analysis between tracks."""
+    net_a: str
+    net_b: str
+    parallel_length_mm: float
+    gap_mm: float
+    crosstalk_pct: float  # estimated crosstalk percentage
+    critical: bool
+    recommendation: str
+
+
+@dataclass
+class EMIPrediction:
+    """EMI/EMC prediction for the board."""
+    score: str  # "low", "medium", "high"
+    loop_areas_mm2: list[float]
+    high_freq_traces: list[tuple[str, float]]  # (net, length_mm)
+    ground_plane_continuous: bool
+    problem_areas: list[str]
+    recommendations: list[str]
+
+
+@dataclass
+class PowerBusResult:
+    """Power bus/distribution analysis."""
+    rail_impedance_mohm: dict[str, float]  # rail -> impedance mΩ
+    ripple_100hz_mv: dict[str, float]
+    ripple_1khz_mv: dict[str, float]
+    decoupling_effectiveness: dict[str, float]  # 0-1
+    bulk_capacitors_needed: list[tuple[str, float]]  # (net, capacitance_uF)
+    recommendations: list[str]
+
+
+@dataclass
 class SimulationReport:
     board_name: str
     current_loops: list[CurrentLoop]
@@ -82,9 +116,14 @@ class SimulationReport:
     audio: AudioPrediction
     stability: StabilityAnalysis
     ir_drop: dict
+    crosstalk: list[CrosstalkResult]
     recommendations: list[str]
     warnings: list[str]
+    emi: Optional[EMIPrediction] = None
+    power_bus: Optional[PowerBusResult] = None
     thermal_heatmap_path: Optional[str] = None
+    crosstalk_map_path: Optional[str] = None
+    emi_map_path: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -541,6 +580,164 @@ def check_capacitive_load(board, caps: list[float] = None) -> list[float]:
     return stable
 
 
+def _parallel_segment_length(seg1, seg2, threshold_mm=1.0) -> float:
+    """Calculate parallel overlap length between two segments."""
+    dx1 = seg1.x2_mm - seg1.x1_mm
+    dy1 = seg1.y2_mm - seg1.y1_mm
+    dx2 = seg2.x2_mm - seg2.x1_mm
+    dy2 = seg2.y2_mm - seg2.y1_mm
+    dot = dx1 * dx2 + dy1 * dy2
+    if dot < 0:
+        return 0.0
+    len1 = math.hypot(dx1, dy1)
+    len2 = math.hypot(dx2, dy2)
+    if len1 < 0.1 or len2 < 0.1:
+        return 0.0
+    return min(len1, len2) * 0.5
+
+
+def analyze_crosstalk(board, segments=None) -> list[CrosstalkResult]:
+    """Analyze crosstalk between tracks for УНЧ."""
+    if segments is None:
+        return []
+    results = []
+    net_segments: dict[str, list] = {}
+    for seg in segments:
+        net_segments.setdefault(seg.net, []).append(seg)
+    nets = list(net_segments.keys())
+    for i, net_a in enumerate(nets):
+        for net_b in nets[i+1:]:
+            if net_a == net_b:
+                continue
+            a_sensitive = any(s in net_a for s in ("IN", "SRC", "FG", "FB"))
+            b_sensitive = any(s in net_b for s in ("IN", "SRC", "FG", "FB"))
+            a_noisy = any(s in net_a for s in ("OUT", "SPK", "VCC", "+V", "-V", "PWR"))
+            b_noisy = any(s in net_b for s in ("OUT", "SPK", "VCC", "+V", "-V", "PWR"))
+            if not ((a_sensitive and b_noisy) or (b_sensitive and a_noisy)):
+                continue
+            total_parallel_mm = 0.0
+            min_gap_mm = float('inf')
+            for seg_a in net_segments[net_a]:
+                for seg_b in net_segments[net_b]:
+                    dist = math.hypot(
+                        (seg_a.x1_mm + seg_a.x2_mm) / 2 - (seg_b.x1_mm + seg_b.x2_mm) / 2,
+                        (seg_a.y1_mm + seg_a.y2_mm) / 2 - (seg_b.y1_mm + seg_b.y2_mm) / 2
+                    )
+                    if dist < 5.0:
+                        min_gap_mm = min(min_gap_mm, dist)
+                        total_parallel_mm += _parallel_segment_length(seg_a, seg_b)
+            if total_parallel_mm > 1.0 and min_gap_mm < 5.0:
+                crosstalk_pct = (total_parallel_mm / max(min_gap_mm, 0.5)) * 0.01
+                crosstalk_pct = min(crosstalk_pct, 10.0)
+                critical = crosstalk_pct > 0.1
+                rec = "Increase gap or route on different layers" if critical else "OK"
+                results.append(CrosstalkResult(
+                    net_a=net_a, net_b=net_b,
+                    parallel_length_mm=round(total_parallel_mm, 2),
+                    gap_mm=round(min_gap_mm, 2),
+                    crosstalk_pct=round(crosstalk_pct, 4),
+                    critical=critical, recommendation=rec,
+                ))
+    results.sort(key=lambda x: x.crosstalk_pct, reverse=True)
+    return results
+
+
+def estimate_emi(board, current_loops=None, segments=None) -> EMIPrediction:
+    """Estimate EMI/EMC for УНЧ board."""
+    problem_areas = []
+    recommendations = []
+    loop_areas_mm2 = []
+    high_freq_traces: list[tuple[str, float]] = []
+    if current_loops is None:
+        current_loops = analyze_current_loops(board, segments)
+    for loop in current_loops:
+        loop_areas_mm2.append(loop.area_mm2)
+        if loop.area_mm2 > 500:
+            problem_areas.append(f"Large loop {loop.net_name}: {loop.area_mm2:.1f} mm²")
+            recommendations.append(f"Reduce loop area for {loop.net_name}")
+    hf_keywords = ("SW", "CLK", "PWM", "OUT")
+    if segments:
+        net_lengths: dict[str, float] = {}
+        for seg in segments:
+            net_lengths[seg.net] = net_lengths.get(seg.net, 0) + math.hypot(
+                seg.x2_mm - seg.x1_mm, seg.y2_mm - seg.y1_mm)
+        for net, length in net_lengths.items():
+            if any(kw in net.upper() for kw in hf_keywords) and length > 50:
+                high_freq_traces.append((net, round(length, 1)))
+                problem_areas.append(f"Long HF trace {net}: {length:.1f}mm")
+    total_loop_area = sum(loop_areas_mm2)
+    score = "low"
+    if total_loop_area > 2000 or len(problem_areas) > 5:
+        score = "high"
+    elif total_loop_area > 1000 or len(problem_areas) > 2:
+        score = "medium"
+    if score == "high":
+        recommendations.append("Critical EMI sources detected")
+    elif score == "medium":
+        recommendations.append("Moderate EMI concerns")
+    else:
+        recommendations.append("Low EMI expected")
+    return EMIPrediction(
+        score=score, loop_areas_mm2=loop_areas_mm2,
+        high_freq_traces=high_freq_traces,
+        ground_plane_continuous=True,
+        problem_areas=problem_areas, recommendations=recommendations,
+    )
+
+
+def analyze_power_bus(board, segments=None) -> PowerBusResult:
+    """Analyze power distribution network for УНЧ ±40V rails."""
+    rail_impedance_mohm = {}
+    ripple_100hz_mv = {}
+    ripple_1khz_mv = {}
+    decoupling_effectiveness = {}
+    bulk_caps_needed = []
+    recommendations = []
+    power_nets = {"+V": 40.0, "-V": -40.0, "+15V": 15.0, "-15V": -15.0}
+    load_currents_ma = {"+V": 200, "-V": 200, "+15V": 50, "-15V": 50}
+    if segments is None:
+        segments = []
+    net_segments: dict[str, list] = {}
+    for seg in segments:
+        net_segments.setdefault(seg.net, []).append(seg)
+    for rail in power_nets:
+        if rail not in net_segments:
+            continue
+        total_length_mm = 0.0
+        total_width_mm = 0.0
+        count = 0
+        for seg in net_segments[rail]:
+            length = math.hypot(seg.x2_mm - seg.x1_mm, seg.y2_mm - seg.y1_mm)
+            total_length_mm += length
+            total_width_mm += seg.width_mm
+            count += 1
+        if count == 0:
+            continue
+        avg_width = total_width_mm / count if count > 0 else 1.0
+        r_mohm = _track_resistance(total_length_mm, avg_width)
+        rail_impedance_mohm[rail] = round(r_mohm, 3)
+        current_ma = load_currents_ma.get(rail, 100)
+        c_bulk = 1000e-6
+        ripple_100hz = (current_ma * r_mohm) / (2 * math.pi * 100 * c_bulk) if c_bulk > 0 else 0
+        ripple_1khz = (current_ma * r_mohm) / (2 * math.pi * 1000 * c_bulk) if c_bulk > 0 else 0
+        ripple_100hz_mv[rail] = round(ripple_100hz * 1000, 3)
+        ripple_1khz_mv[rail] = round(ripple_1khz * 1000, 3)
+        dec_eff = min(1.0, 1000 / max(total_length_mm, 10))
+        decoupling_effectiveness[rail] = round(dec_eff, 2)
+        if ripple_100hz > 0.5:
+            caps_needed = int(current_ma / 50) * 1000
+            bulk_caps_needed.append((rail, caps_needed))
+            recommendations.append(f"Add {caps_needed}uF bulk cap on {rail}")
+    return PowerBusResult(
+        rail_impedance_mohm=rail_impedance_mohm,
+        ripple_100hz_mv=ripple_100hz_mv,
+        ripple_1khz_mv=ripple_1khz_mv,
+        decoupling_effectiveness=decoupling_effectiveness,
+        bulk_capacitors_needed=bulk_caps_needed,
+        recommendations=recommendations,
+    )
+
+
 def generate_thermal_heatmap(board, thermal_results: list[ThermalResult],
                              output_path: str = "thermal_heatmap.png") -> str:
     """Generate thermal heatmap as PNG.
@@ -730,6 +927,27 @@ def run_full_simulation(board, segments=None, jumpers=None,
         if drop > 50:  # > 50mV is concerning
             warnings.append(f"Significant IR drop on {net}: {drop:.1f}mV")
 
+    # Crosstalk analysis
+    logger.info("Analyzing crosstalk...")
+    crosstalk = analyze_crosstalk(board, segments)
+    logger.info(f"Found {len(crosstalk)} crosstalk pairs")
+    critical_ct = [c for c in crosstalk if c.critical]
+    if critical_ct:
+        warnings.append(f"Critical crosstalk found: {len(critical_ct)} pairs")
+
+    # EMI analysis
+    logger.info("Analyzing EMI...")
+    emi = estimate_emi(board, current_loops, segments)
+    if emi.score == "high":
+        warnings.append("High EMI detected - review layout")
+
+    # Power bus analysis
+    logger.info("Analyzing power bus...")
+    power_bus = analyze_power_bus(board, segments)
+    if power_bus.bulk_capacitors_needed:
+        for rail, cap in power_bus.bulk_capacitors_needed:
+            recommendations.append(f"Add {cap:.0f}uF bulk cap on {rail}")
+
     board_name = getattr(board, 'name', 'unknown')
 
     return SimulationReport(
@@ -739,7 +957,10 @@ def run_full_simulation(board, segments=None, jumpers=None,
         audio=audio,
         stability=stability,
         ir_drop=ir_drop,
+        crosstalk=crosstalk,
         recommendations=recommendations,
         warnings=warnings,
         thermal_heatmap_path=thermal_heatmap_path,
+        emi=emi,
+        power_bus=power_bus,
     )
