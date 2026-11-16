@@ -71,15 +71,15 @@ pub struct RouteSegment {
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyRoutedBoard {
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub segments: Vec<(f64, f64, f64, f64, String, String)>,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub routed_nets: Vec<String>,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub failed_nets: Vec<String>,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub total_length_mm: f64,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub score: f64,
 }
 
@@ -100,19 +100,19 @@ impl PyRoutedBoard {
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyRoutingOptions {
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub seed: i32,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub attempts: i32,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub grid_mm: f64,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub min_clearance_mm: f64,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub min_track_mm: f64,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub power_track_mm: f64,
-    #[pyo13(get, set)]
+    #[pyo3(get, set)]
     pub high_current_track_mm: f64,
 }
 
