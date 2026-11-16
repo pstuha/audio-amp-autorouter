@@ -195,7 +195,7 @@ def _net_order(pads: Dict[str, List[Tuple[str, str, float, float]]]) -> List[str
 class _State:
     """Mutable routing state for one pass: grid, occupancy and per-net paths."""
 
-    def __init__(self, board: Board, rules: DesignRules, lut: LutProfile):
+    def __init__(self, board: Board, rules: DesignRules, lut: LutProfile, penalty_zones: Optional[Set[Point]] = None):
         self.board = board
         self.rules = rules
         self.grid = max(0.25, rules.grid_mm)
@@ -212,6 +212,7 @@ class _State:
         self.occ: Dict[str, Set[Point]] = {}
         self.busy: Set[Point] = set()
         self.rip_ups = 0
+        self.penalty_zones: Set[Point] = penalty_zones or set()
 
     def rul_width(self, net: str) -> float:
         cls = classify_net(net)
@@ -277,13 +278,13 @@ class Router:
         runs: List[Tuple[Point, Point]] = []
         cls = classify_net(net)
         cost_weight = _COST.get(cls, 1.0)
-        avoid: Optional[Set[Point]] = None
+        avoid: Optional[Set[Point]] = state.penalty_zones if state.penalty_zones else None
         if cls in ("signal", "control", "feedback"):
             power_zone: Set[Point] = set()
             for other, occ in state.occ.items():
                 if classify_net(other) in ("power", "high_current"):
                     power_zone |= _inflate(occ, _POWER_ZONE)
-            avoid = power_zone
+            avoid = (power_zone | state.penalty_zones) if state.penalty_zones else power_zone
         while remaining:
             target = min(remaining, key=lambda p: min(_dist(p, c) for c in connected))
             segment = _astar(target, connected, state.blocked_for(net), state.bounds,
@@ -365,6 +366,38 @@ class Router:
                   f"iterations={best.iterations} rip_ups={best.rip_ups}")
         return best
 
+    def route_with_penalty_zones(self, board: Board, penalty_zones: Set[Point], seed: int = 17, attempts: int = 6) -> RoutingSolution:
+        """Route with penalty zones that increase routing cost in certain areas.
+        
+        penalty_zones: Set of grid points where routing cost is 4x higher.
+        """
+        self.log = []
+        state = _State(board, self.rules, self.lut, penalty_zones=penalty_zones)
+        order = _net_order(state.net_pads)
+        best: Optional[RoutingSolution] = None
+        rng = random.Random(seed)
+
+        for attempt in range(max(1, attempts)):
+            net_order = list(order)
+            if attempt:
+                tail = [n for n in net_order if _net_key(n)[0] >= 4]
+                head = [n for n in net_order if n not in tail]
+                rng.shuffle(tail)
+                net_order = head + tail
+            sol = self._run_improve_with_penalty(board, net_order, seed + attempt, penalty_zones)
+            if best is None or sol.score < best.score:
+                best = sol
+            self._log(f"attempt={attempt + 1} routed={len(sol.routed_nets)} failed={len(sol.failed_nets)} "
+                      f"jumpers={sol.jumper_count} length={sol.total_length_mm:.1f}mm score={sol.score:.0f} (penalized)")
+            if sol.ok and sol.jumper_count == 0:
+                break
+
+        assert best is not None
+        self._log(f"best (penalized): routed={len(best.routed_nets)} failed={len(best.failed_nets)} "
+                  f"jumpers={best.jumper_count} length={best.total_length_mm:.1f}mm "
+                  f"iterations={best.iterations} rip_ups={best.rip_ups}")
+        return best
+
     def _run_improve(self, board: Board, net_order: List[str], seed: int) -> RoutingSolution:
         """Iterative improvement: replay the pass from a fresh state each round,
         keeping the cheapest solution (jumpers dominate, then total length)."""
@@ -373,6 +406,28 @@ class Router:
         iteration = 0
         for iteration in range(_IMPROVE_PASSES):
             s = _State(board, self.rules, self.lut)
+            order = list(net_order)
+            if iteration:
+                tail = [n for n in order if _net_key(n)[0] >= 4]
+                head = [n for n in order if n not in tail]
+                rng.shuffle(tail)
+                order = head + tail
+            sol = self._pass_once(s, order)
+            if best_pass is None or sol.score < best_pass.score:
+                best_pass = sol
+                if sol.ok and sol.jumper_count == 0:
+                    break
+        best_pass.iterations = iteration + 1
+        best_pass.rip_ups = best_pass.rip_ups
+        return best_pass
+
+    def _run_improve_with_penalty(self, board: Board, net_order: List[str], seed: int, penalty_zones: Set[Point]) -> RoutingSolution:
+        """Iterative improvement with penalty zones for simulation-aware routing."""
+        best_pass: Optional[RoutingSolution] = None
+        rng = random.Random(seed)
+        iteration = 0
+        for iteration in range(_IMPROVE_PASSES):
+            s = _State(board, self.rules, self.lut, penalty_zones=penalty_zones)
             order = list(net_order)
             if iteration:
                 tail = [n for n in order if _net_key(n)[0] >= 4]

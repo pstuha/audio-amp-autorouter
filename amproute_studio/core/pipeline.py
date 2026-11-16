@@ -327,10 +327,15 @@ def _route_with_penalty(
     opts: PipelineOptions,
     zones: List[PenaltyZone],
 ) -> Optional[RoutingSolution]:
-    """Route with penalty zones applied."""
-    # For now, just re-run normal routing
-    # The penalty zones would need to be passed to A* via the avoid parameter
-    return router.route(board, seed=opts.seed, attempts=opts.attempts)
+    """Route with penalty zones applied.
+    
+    penalty_zones are grid points where routing cost is 4x higher,
+    encouraging the router to find alternate paths around problematic areas.
+    """
+    avoid = points_in_penalty_zones(zones, opts.rules.grid_mm)
+    if not avoid:
+        return router.route(board, seed=opts.seed, attempts=opts.attempts)
+    return router.route_with_penalty_zones(board, avoid, seed=opts.seed, attempts=opts.attempts)
 
 
 def run_pipeline(
