@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Verify binary runs
+        run: |
+          .\target\release\amproute-studio.exe --cli --output verify
+          if (-not (Test-Path verify\board.gbr)) { throw "Gerber missing" }
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\amproute-studio.exe dist\AmpRoute-Studio.exe
+          Copy-Item README.md, LICENSE, CHANGELOG.md dist\
+          Compress-Archive -Path dist\* -DestinationPath AmpRoute-Studio-windows-x86_64.zip -Force
+          Get-ChildItem AmpRoute-Studio-windows-x86_64.zip | Format-Table Name, Length
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/AmpRoute-Studio.exe
+            AmpRoute-Studio-windows-x86_64.zip
+          generate_release_notes: true
+          body: |
+            **AmpRoute Studio** — autorouter and 2-D board viewer for single-layer
+            LUT (laser-iron / toner-transfer) audio amplifier PCBs.
+
+            Download `AmpRoute-Studio.exe` and run it — the GUI opens on launch.
+            No installer and no console window are needed.
+
+            Command line: `AmpRoute-Studio.exe --cli` routes the demo board and
+            writes Gerber, SVG, PDF and a 1:1 LUT print template to `output/`.
+
+            Export is refused when a net fails to route, so an incomplete layout
+            is never presented as manufacturing-ready.

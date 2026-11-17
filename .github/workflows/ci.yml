@@ -4,44 +4,48 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.13"]
+    name: Build and test
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - run: python -m pip install --upgrade pip
-      - run: pip install -e ".[dev,mcp]"
-      - run: ruff check .
-      - run: pytest -q
 
-  kicad-release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/inti-cmnb/kicad9_auto:latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install deps
-        run: pip install --break-system-packages "numpy>=1.26" "shapely>=2.0"
-      - name: Run pipeline on example board
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Smoke-test headless export
         run: |
-          python -m amproute_studio.cli run examples/amplifier.kicad_pcb -o examples/amplifier_out.kicad_pcb
-          kicad-cli pcb drc --severity-error --exit-code-violations examples/amplifier_out.kicad_pcb
-      - name: Generate gerbers
-        run: |
-          kicad-cli pcb export gerbers --output gerber_out/ examples/amplifier_out.kicad_pcb
-          (cd gerber_out && zip -r ../gerbers.zip .)
-      - name: Upload gerber archive
+          .\target\release\amproute-studio.exe --cli --output ci-output
+          if (-not (Test-Path ci-output\board.gbr)) { throw "Gerber was not produced" }
+          if (-not (Test-Path ci-output\lut_print.pdf)) { throw "LUT template was not produced" }
+          Get-ChildItem ci-output | Format-Table Name, Length
+
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: gerbers
-          path: gerbers.zip
+          name: amproute-studio-windows-x86_64
+          path: target/release/amproute-studio.exe
+          if-no-files-found: error
