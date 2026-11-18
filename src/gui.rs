@@ -1,10 +1,10 @@
 //! AmpRoute Studio — professional 2-D board viewer and router front-end.
 //!
-//! Layout: menu bar, left inspector (board picker + nets + components), central
-//! board canvas with zoom/pan, right statistics/DRC panel, bottom status bar.
+//! Layout: left panel (status + controls), central board canvas with zoom/pan,
+//! right statistics/DRC panel, bottom status bar.
 
-use crate::board::{Board, NetClass};
-use crate::boards::BOARD_SPECS;
+use crate::board::Board;
+use crate::board::NetClass;
 use crate::export;
 use crate::import;
 use crate::kicad;
@@ -33,7 +33,34 @@ pub struct AmpRouteApp {
     routing_ms: f64,
     thermal_field: Option<thermal::ThermalField>,
     file_path: Option<PathBuf>,
-    board_spec_index: Option<usize>,
+    /// A routing pass running on a worker thread, if any.
+    route_job: Option<std::sync::mpsc::Receiver<RouteOutcome>>,
+    /// When the current pass started, for the elapsed-time readout.
+    route_started: Option<std::time::Instant>,
+    stage: RouteStage,
+}
+
+/// Everything a background routing pass produces.
+struct RouteOutcome {
+    result: RoutingResult,
+    thermal: thermal::ThermalField,
+    drc: Vec<String>,
+    elapsed_ms: f64,
+}
+
+/// What the router is doing right now, so the window never looks frozen.
+#[derive(Clone, Copy, PartialEq)]
+enum RouteStage {
+    /// No board loaded yet.
+    Idle,
+    /// Board loaded, nothing routed.
+    Ready,
+    /// A routing pass is in progress.
+    Routing,
+    /// Routing finished.
+    Done,
+    /// Routing finished with nets left over.
+    Incomplete,
 }
 
 /// Run the thermal simulation for a board with its own heat sources.
@@ -44,25 +71,27 @@ fn simulate(board: &Board) -> thermal::ThermalField {
 
 impl AmpRouteApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Dark, professional theme.
+        // Dark, quiet interface: the board is the only thing that carries colour.
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(18, 26, 22);
-        visuals.window_fill = Color32::from_rgb(22, 32, 27);
-        visuals.extreme_bg_color = Color32::from_rgb(12, 18, 15);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(28, 40, 33);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(34, 48, 40);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(46, 66, 54);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(58, 82, 66);
-        visuals.selection.bg_fill = Color32::from_rgb(60, 120, 85);
+        visuals.panel_fill = Color32::from_rgb(30, 30, 33);
+        visuals.window_fill = Color32::from_rgb(36, 36, 40);
+        visuals.extreme_bg_color = Color32::from_rgb(20, 20, 23);
+        visuals.faint_bg_color = Color32::from_rgb(40, 40, 45);
+        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(42, 42, 47);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(52, 52, 58);
+        visuals.widgets.inactive.fg_stroke =
+            Stroke::new(1.0_f32, Color32::from_rgb(216, 216, 224));
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(66, 66, 74);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(84, 148, 112);
+        visuals.selection.bg_fill = Color32::from_rgb(56, 132, 94);
+        visuals.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(190, 235, 210));
+        visuals.hyperlink_color = Color32::from_rgb(120, 190, 235);
         cc.egui_ctx.set_visuals(visuals);
 
-        let board = (BOARD_SPECS[0].build)();
-        let grid_mm = board.preset.grid_mm;
-        let thermal_field = simulate(&board);
-        let mut app = Self {
+        let app = Self {
             result: RoutingResult::new(),
             drc: Vec::new(),
-            board,
+            board: Board::new("Empty", 100.0, 80.0, crate::board::LutPreset::reliable()),
             zoom: 3.2,
             pan: Vec2::new(40.0, 40.0),
             show_components: true,
@@ -72,57 +101,109 @@ impl AmpRouteApp {
             show_thermal: false,
             show_heatmap: false,
             selected_net: None,
-            status: "Ready — press Route (F5) to autoroute the board".into(),
-            grid_mm,
+            status: "Open a .kicad_pcb file to begin".into(),
+            grid_mm: 0.5,
             routing_ms: 0.0,
-            thermal_field: Some(thermal_field),
+            thermal_field: None,
             file_path: None,
-            board_spec_index: Some(0),
+            route_job: None,
+            route_started: None,
+            stage: RouteStage::Idle,
         };
-        app.route();
         app
     }
 
     fn route(&mut self) {
-        let started = std::time::Instant::now();
-        let mut router = Router::new(self.grid_mm, self.board.width_mm, self.board.height_mm);
-        // Thermal hotspots (ТЗ 5.3).
-        for (x, y, r) in self.board.thermal_hotspots() {
-            router.add_penalty_circle(x, y, r);
+        if self.route_job.is_some() {
+            return;
         }
-        // Star-ground keepout (ТЗ 5.1).
-        if let Some((x, y)) = self.board.star_ground_point() {
-            router.add_penalty_circle(x, y, 8.0);
+        if self.board.nets.is_empty() {
+            self.status =
+                "Nothing to route: no net is assigned to a pad in this file".into();
+            self.stage = RouteStage::Incomplete;
+            self.drc = vec!["Board has no nets — check that pads carry net assignments".into()];
+            return;
         }
-        self.result = router.route_board(&self.board);
-        self.routing_ms = started.elapsed().as_secs_f64() * 1000.0;
 
-        // Diagnostics: structural validation plus component placement checks.
-        let mut issues = self.board.validate();
-        issues.extend(crate::placement::PlacementResult {
-            board: self.board.clone(),
-        }.drc_report(self.board.preset.min_clearance_mm));
-        self.drc = issues;
+        // Routing a large board takes seconds. Run it on a worker so the window
+        // keeps drawing and the stage readout can show what is happening.
+        let board = self.board.clone();
+        let grid_mm = self.grid_mm;
+        let (tx, rx) = std::sync::mpsc::channel();
 
-        self.thermal_field = Some(simulate(&self.board));
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut router = Router::new(grid_mm, board.width_mm, board.height_mm);
+            for (x, y, r) in board.thermal_hotspots() {
+                router.add_penalty_circle(x, y, r);
+            }
+            if let Some((x, y)) = board.star_ground_point() {
+                router.add_penalty_circle(x, y, 8.0);
+            }
+            let result = router.route_board(&board);
 
-        self.status = if self.result.failed_nets.is_empty() {
-            format!(
-                "Routed {}/{} nets in {:.0} ms · {:.1} mm of copper · export ready",
-                self.result.routed_nets.len(),
-                self.result.total_nets(),
-                self.routing_ms,
-                self.result.total_length_mm
-            )
-        } else {
-            format!(
-                "Only {}/{} nets routed in {:.0} ms · {} incomplete — export blocked",
-                self.result.routed_nets.len(),
-                self.result.total_nets(),
-                self.routing_ms,
-                self.result.failed_nets.len()
-            )
+            let mut drc = board.validate();
+            drc.extend(
+                crate::placement::PlacementResult {
+                    board: board.clone(),
+                }
+                .drc_report(board.preset.min_clearance_mm),
+            );
+
+            let sources = thermal::sources_for(&board);
+            let thermal = thermal::solve(&board, &sources, &ThermalParams::default());
+
+            let outcome = RouteOutcome {
+                result,
+                thermal,
+                drc,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            };
+            // The receiver is gone only if the app closed; dropping is fine.
+            let _ = tx.send(outcome);
+        });
+
+        self.route_job = Some(rx);
+        self.route_started = Some(std::time::Instant::now());
+        self.stage = RouteStage::Routing;
+        self.status = "Routing · placing copper on nets".into();
+    }
+
+    /// Collect the result of a finished routing pass, if it has arrived.
+    fn poll_route(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.route_job else { return };
+        // `try_recv` keeps the UI responsive; a repaint is requested below while
+        // the job is still running.
+        let Ok(outcome) = rx.try_recv() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            return;
         };
+
+        self.result = outcome.result;
+        self.thermal_field = Some(outcome.thermal);
+        self.drc = outcome.drc;
+        self.route_started = None;
+        self.route_job = None;
+
+        if self.result.failed_nets.is_empty() {
+            self.stage = RouteStage::Done;
+            self.status = format!(
+                "Router · done — {}/{} nets in {:.0} ms, {:.1} mm of copper",
+                self.result.routed_nets.len(),
+                self.result.total_nets(),
+                outcome.elapsed_ms,
+                self.result.total_length_mm
+            );
+        } else {
+            self.stage = RouteStage::Incomplete;
+            self.status = format!(
+                "Router · {}/{} nets in {:.0} ms — {} net(s) could not be placed",
+                self.result.routed_nets.len(),
+                self.result.total_nets(),
+                outcome.elapsed_ms,
+                self.result.failed_nets.len()
+            );
+        }
     }
 
     fn export_kicad(&mut self) {
@@ -150,20 +231,6 @@ impl AmpRouteApp {
             }
             Err(e) => self.status = format!("Export blocked — {e}"),
         }
-    }
-
-    fn load_board_spec(&mut self, idx: usize) {
-        if idx >= BOARD_SPECS.len() {
-            return;
-        }
-        self.board = (BOARD_SPECS[idx].build)();
-        self.grid_mm = self.board.preset.grid_mm;
-        self.board_spec_index = Some(idx);
-        self.file_path = None;
-        self.selected_net = None;
-        self.zoom = 3.2;
-        self.pan = Vec2::new(40.0, 40.0);
-        self.route();
     }
 
     fn load_from_file(&mut self, path: PathBuf) {
@@ -198,12 +265,23 @@ impl AmpRouteApp {
 
         self.board = board;
         self.grid_mm = self.board.preset.grid_mm;
-        self.board_spec_index = None;
         self.file_path = Some(path);
         self.selected_net = None;
         self.zoom = 3.2;
         self.pan = Vec2::new(40.0, 40.0);
-        self.route();
+        // A fresh board has no copper yet: drop whatever the previous one left.
+        self.result = RoutingResult::new();
+        self.drc.clear();
+        self.thermal_field = Some(simulate(&self.board));
+        self.route_job = None;
+        self.route_started = None;
+        self.stage = RouteStage::Ready;
+        self.status = format!(
+            "Loaded · {} · {} nets · {} pads · press Route PCB",
+            self.board.name,
+            self.board.nets.len(),
+            self.board.all_pads().len()
+        );
     }
 
     fn net_color(&self, name: &str) -> Color32 {
@@ -433,29 +511,30 @@ impl AmpRouteApp {
     fn left_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
 
-        // Board picker.
-        ui.heading(RichText::new("Board").size(14.0).strong());
-        ui.separator();
-        egui::ComboBox::from_id_salt("board_picker")
-            .selected_text(
-                self.board_spec_index
-                    .map(|i| BOARD_SPECS[i].summary)
-                    .unwrap_or("Custom (loaded from file)"),
-            )
-            .show_ui(ui, |ui| {
-                for (i, spec) in BOARD_SPECS.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.board_spec_index == Some(i), spec.summary)
-                        .clicked()
-                    {
-                        self.load_board_spec(i);
-                        ui.close_menu();
-                    }
-                }
-            });
+        // The board comes from a file. There is no built-in board list: the
+        // program is a router for your project, not a demo viewer.
+        let board_label = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "No board loaded".into());
+        ui.label(RichText::new(board_label).strong().size(13.0));
+        ui.label(
+            RichText::new(if self.file_path.is_some() {
+                "Loaded from file"
+            } else {
+                "Open a .kicad_pcb to begin"
+            })
+            .size(11.0)
+            .color(Color32::from_gray(150)),
+        );
 
-        ui.add_space(4.0);
-        if ui.button("Open .kicad_pcb / JSON…").clicked() {
+        ui.add_space(6.0);
+        if ui
+            .add_sized([ui.available_width(), 26.0], egui::Button::new("Open board…"))
+            .clicked()
+        {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("KiCad PCB", &["kicad_pcb"])
                 .add_filter("JSON", &["json"])
@@ -463,6 +542,26 @@ impl AmpRouteApp {
             {
                 self.load_from_file(path);
             }
+        }
+
+        ui.add_space(4.0);
+        let can_route = !self.board.nets.is_empty();
+        if ui
+            .add_enabled(
+                can_route,
+                egui::Button::new(RichText::new("⚡ Route PCB").size(13.0))
+                    .min_size(Vec2::new(ui.available_width(), 28.0)),
+            )
+            .clicked()
+        {
+            self.route();
+        }
+        if !can_route {
+            ui.label(
+                RichText::new("No nets to route — the file has no net assignments")
+                    .size(10.0)
+                    .color(Color32::from_rgb(220, 150, 100)),
+            );
         }
 
         ui.add_space(8.0);
@@ -659,51 +758,15 @@ impl eframe::App for AmpRouteApp {
                         }
                         ui.close_menu();
                     }
-                    if ui.button("Export KiCad PCB (Ctrl+K)").clicked() {
-                        self.export_kicad();
-                        ui.close_menu();
-                    }
-                    if ui.button("Export Gerber/All (Ctrl+E)").clicked() {
-                        self.export_all();
-                        ui.close_menu();
-                    }
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
-                ui.menu_button("Board", |ui| {
-                    if ui.button("Route all nets (F5)").clicked() {
-                        self.route();
-                        ui.close_menu();
-                    }
-                    if ui.button("Reset view").clicked() {
-                        self.zoom = 3.2;
-                        self.pan = Vec2::new(40.0, 40.0);
-                        ui.close_menu();
-                    }
-                });
-                ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_copper, "Copper tracks");
-                    ui.checkbox(&mut self.show_components, "Components");
-                    ui.checkbox(&mut self.show_pads, "Pads");
-                    ui.checkbox(&mut self.show_grid, "10 mm grid");
-                    ui.checkbox(&mut self.show_thermal, "Soft zones");
-                    ui.checkbox(&mut self.show_heatmap, "Heatmap");
-                });
                 ui.menu_button("Help", |ui| {
                     ui.label(RichText::new("AmpRoute Studio").strong());
                     ui.label(format!("v{}", crate::VERSION));
                     ui.label("Autorouter for LUT audio amplifier PCBs");
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⬇ KiCad (.kicad_pcb)").clicked() {
-                        self.export_kicad();
-                    }
-                    if ui.button("⚡ Route (F5)").clicked() {
-                        self.route();
-                    }
                 });
             });
         });
@@ -738,6 +801,9 @@ impl eframe::App for AmpRouteApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.draw_canvas(ui);
         });
+
+        // While a routing pass runs, poll for its result and keep the window alive.
+        self.poll_route(ctx);
     }
 }
 
@@ -766,6 +832,7 @@ pub fn segments_of<'a>(result: &'a RoutingResult, net: &str) -> Vec<&'a RouteSeg
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boards::BOARD_SPECS;
 
     #[test]
     fn auto_placement_routes_most_nets() {

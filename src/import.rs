@@ -87,15 +87,37 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
 
     let mut report = ImportReport::default();
 
-    // Net table: KiCad stores `(net 3 "GND")` at the top level and refers to
-    // pads by number. Net 0 means "unconnected".
-    let mut net_names: HashMap<String, String> = HashMap::new();
+    // Net table. KiCad v5..9 stores `(net 3 "GND")` at the top level and pads
+    // refer to nets by number. KiCad 10+ drops the table: net names live on the
+    // pads themselves as `(net "GND")`. We read whatever table exists and treat
+    // an unknown token as a net name, which covers both dialects.
+    let mut net_codes: HashMap<String, String> = HashMap::new();
     for net in root.children("net") {
-        let code = net.atom(1).unwrap_or("").to_string();
-        let name = net.atom(2).unwrap_or("").to_string();
-        if !code.is_empty() && code != "0" && !name.is_empty() {
-            net_names.insert(code, name);
+        let atoms = net.atoms();
+        let (code, name) = if atoms.len() >= 3 {
+            (atoms[1], atoms[2])
+        } else if atoms.len() == 2 {
+            (atoms[1], atoms[1])
+        } else {
+            continue;
+        };
+        if name.is_empty() || code == "0" {
+            continue;
         }
+        net_codes.insert(code.to_string(), name.to_string());
+    }
+
+    /// Turn the token inside a pad's `(net …)` node into a net name.
+    fn resolve_net(token: &str, codes: &HashMap<String, String>) -> Option<String> {
+        if token.is_empty() || token == "0" {
+            return None;
+        }
+        Some(codes.get(token).cloned().unwrap_or_else(|| token.to_string()))
+    }
+
+    /// The token inside a `(net …)` node — a code in old files, a name in new ones.
+    fn net_token(node: &Sexpr) -> Option<String> {
+        node.atom(1).map(|s| s.to_string())
     }
 
     // Outline from Edge.Cuts. Fall back to the bounding box of all pads.
@@ -133,7 +155,8 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
         if lib_id.starts_with("MountingHole") {
             for pad_node in fp_node.children("pad") {
                 let pad_type = pad_node.atom(2).unwrap_or("");
-                if pad_type != "np_thru_hole" {
+                // Accept both non-plated and plated mounting-hole pads.
+                if pad_type != "np_thru_hole" && pad_type != "thru_hole" {
                     continue;
                 }
                 if let Some(drill) = pad_node.child("drill").and_then(|d| d.value()) {
@@ -186,8 +209,8 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
             // A pad with no net is either mechanical or unassigned.
             let net = pad_node
                 .child("net")
-                .and_then(|n| n.atom(1))
-                .and_then(|code| net_names.get(code).cloned());
+                .and_then(|n| net_token(n))
+                .and_then(|token| resolve_net(&token, &net_codes));
 
             let index = pads.len();
             pads.push(Pad::new(px, py, size, drill));
@@ -304,8 +327,9 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
         let net_code = seg
             .child("net")
             .and_then(|n| n.atom(1))
-            .unwrap_or("0")
-            .to_string();
+            .unwrap_or("0");
+        let net_name = resolve_net(net_code, &net_codes)
+            .unwrap_or_else(|| format!("net{}", net_code));
         tracks.push(ImportedTrack {
             x1: start.number(1).unwrap_or(0.0) + offset_x,
             y1: start.number(2).unwrap_or(0.0) + offset_y,
@@ -313,10 +337,7 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
             y2: end.number(2).unwrap_or(0.0) + offset_y,
             width: seg.child("width").and_then(|w| w.value()).unwrap_or(0.25),
             layer: seg.atom(2).unwrap_or("F.Cu").to_string(),
-            net: net_names
-                .get(&net_code)
-                .cloned()
-                .unwrap_or_else(|| format!("net{net_code}")),
+            net: net_name,
         });
     }
     report.existing_tracks = tracks.len();
