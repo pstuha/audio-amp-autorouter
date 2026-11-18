@@ -8,8 +8,9 @@
 //! nets are reported as failed and contribute no copper.
 
 use crate::board::{Board, NetClass};
+use crate::occupancy::Occupancy;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 
 /// A routed track segment.
 #[derive(Debug, Clone)]
@@ -20,6 +21,9 @@ pub struct RouteSegment {
     pub y2_mm: f64,
     pub net: String,
     pub class: NetClass,
+    /// Actual copper width: the class width, narrowed only where the class
+    /// width does not fit between existing pads or tracks.
+    pub width_mm: f64,
 }
 
 impl RouteSegment {
@@ -31,7 +35,14 @@ impl RouteSegment {
             y2_mm: y2,
             net: net.into(),
             class,
+            width_mm: class.track_width_mm(),
         }
+    }
+
+    /// Same segment, drawn at `width_mm` instead of the class width.
+    pub fn with_width(mut self, width_mm: f64) -> Self {
+        self.width_mm = width_mm;
+        self
     }
 
     pub fn length_mm(&self) -> f64 {
@@ -61,23 +72,34 @@ impl RoutingResult {
 }
 
 /// Grid-based router with soft penalty zones (thermal, star-ground).
+///
+/// Hard obstacles — pads of other nets, routed copper, mounting holes and the
+/// board edge — live in [`Occupancy`], which test them with exact millimetre
+/// geometry instead of stamping them into whole grid cells.
 pub struct Router {
     pub grid_mm: f64,
     /// Soft zones: passable, but expensive.
     pub penalty_zones: HashSet<(i32, i32)>,
-    /// Hard zones: never passable.
-    pub blocked: HashSet<(i32, i32)>,
+    /// How strongly a cell inside a soft zone is avoided. A moderate default:
+    /// strong enough to prefer free board, weak enough that a zone never
+    /// wrecks the routing of a dense single-layer board.
+    pub penalty_weight: f32,
     pub bounds: (i32, i32, i32, i32),
 }
 
 #[derive(Clone)]
 struct Node {
-    total: f64,
-    point: (i32, i32),
+    /// Cost from the start to this cell. Kept so a stale heap entry can be
+    /// recognised and dropped instead of expanded a second time.
+    g: f32,
+    /// `g` plus the distance heuristic: the priority.
+    total: f32,
+    /// Flat index into the search grid.
+    cell: usize,
 }
 impl PartialEq for Node {
     fn eq(&self, o: &Self) -> bool {
-        self.total == o.total && self.point == o.point
+        self.total == o.total && self.cell == o.cell
     }
 }
 impl Eq for Node {}
@@ -96,6 +118,64 @@ fn mdist(a: (i32, i32), b: (i32, i32)) -> i32 {
     (a.0 - b.0).abs() + (a.1 - b.1).abs()
 }
 
+/// Which cells one net may occupy at one track width, and what entering each
+/// costs.
+///
+/// Every clearance test runs once per cell here instead of once per neighbour
+/// expansion in the search, and the result is reused for every terminal of the
+/// net: a net's own copper never blocks itself, so the map stays valid while
+/// that net is being routed. This is what makes trying many net orders and
+/// reroutes affordable.
+struct CostGrid {
+    w: usize,
+    h: usize,
+    minx: i32,
+    miny: i32,
+    /// Cost of entering each cell; infinite where the cell is blocked.
+    step: Vec<f32>,
+}
+
+impl CostGrid {
+    #[inline]
+    fn flat(&self, c: (i32, i32)) -> usize {
+        (c.1 - self.miny) as usize * self.w + (c.0 - self.minx) as usize
+    }
+
+    #[inline]
+    fn point(&self, i: usize) -> (i32, i32) {
+        (
+            self.minx + (i % self.w) as i32,
+            self.miny + (i / self.w) as i32,
+        )
+    }
+
+    #[inline]
+    fn inside(&self, c: (i32, i32)) -> bool {
+        c.0 >= self.minx
+            && c.1 >= self.miny
+            && ((c.0 - self.minx) as usize) < self.w
+            && ((c.1 - self.miny) as usize) < self.h
+    }
+}
+
+/// A routing attempt and the net order that produced it.
+struct Attempt {
+    order: Vec<usize>,
+    run: OrderRun,
+}
+
+/// One net that could not be routed, and the nets whose copper walls it in.
+struct StuckNet {
+    net: usize,
+    blockers: Vec<usize>,
+}
+
+/// The outcome of routing the nets in one particular order.
+struct OrderRun {
+    result: RoutingResult,
+    stuck: Vec<StuckNet>,
+}
+
 /// Extra cost for running next to a net of another class (ТЗ 5.2).
 fn proximity_cost(own: NetClass, other: NetClass) -> f64 {
     0.05 * own.proximity_penalty(other)
@@ -107,7 +187,7 @@ impl Router {
         Self {
             grid_mm,
             penalty_zones: HashSet::new(),
-            blocked: HashSet::new(),
+            penalty_weight: 1.5,
             bounds: (
                 0,
                 0,
@@ -117,8 +197,8 @@ impl Router {
         }
     }
 
-    /// Add a circular keep-out / penalty zone around a thermal hotspot or the
-    /// star-ground point. Zones are soft: they cost more but stay passable.
+    /// Add a soft zone around a thermal hotspot or the star-ground point.
+    /// Zones cost more but stay passable.
     pub fn add_penalty_circle(&mut self, cx: f64, cy: f64, radius_mm: f64) {
         let cx_g = (cx / self.grid_mm).round() as i32;
         let cy_g = (cy / self.grid_mm).round() as i32;
@@ -139,50 +219,157 @@ impl Router {
         )
     }
 
-    /// Stamp a disc of cells into `owner`, without overwriting existing claims.
-    fn stamp(
-        &self,
-        owner: &mut HashMap<(i32, i32), usize>,
-        center: (i32, i32),
-        radius_cells: i32,
-        net: usize,
-    ) {
-        for dy in -radius_cells..=radius_cells {
-            for dx in -radius_cells..=radius_cells {
-                if dx * dx + dy * dy <= radius_cells * radius_cells {
-                    owner.entry((center.0 + dx, center.1 + dy)).or_insert(net);
-                }
-            }
-        }
+    /// Centre of a cell in millimetres.
+    fn point(&self, c: (i32, i32)) -> (f64, f64) {
+        (c.0 as f64 * self.grid_mm, c.1 as f64 * self.grid_mm)
     }
 
     /// Route every net of `board`.
     ///
-    /// Several deterministic net orders are attempted (priority order, reverse,
-    /// and by terminal count) and the run that routes the most nets wins, ties
-    /// broken by shorter total copper. Only fully connected nets emit copper.
+    /// Net ordering decides whether a single-layer board closes: a wide power
+    /// rail laid first can box in a thin signal net that would have been trivial
+    /// on its own. So a fixed set of deterministic orders is tried (see
+    /// [`Router::net_orders`]) and the run that routes the most nets wins, ties
+    /// broken by shorter total copper.
+    ///
+    /// If a net still fails, the successful orders are searched again with that
+    /// net moved earlier: ahead of each net whose copper walls it in when that is
+    /// known, and otherwise simply first. That is what a human does with a
+    /// marker — change the order of the conflicting traces, not the rules.
     pub fn route_board(&self, board: &Board) -> RoutingResult {
+        let mut current = self.best_of(self.net_orders(board), board);
+        if current.run.result.failed_nets.is_empty() {
+            return current.run.result;
+        }
+
+        // (net moved, net it was moved in front of; `usize::MAX` = to the front).
+        let mut tried: HashSet<(usize, usize)> = HashSet::new();
+        let budget = (4 * board.nets.len()).clamp(8, 40);
+
+        for _ in 0..budget {
+            if current.run.result.failed_nets.is_empty() {
+                break;
+            }
+
+            // Best next move: promote a stuck net ahead of one of its blockers,
+            // and failing any known blocker, to the front of the order.
+            let Some((stuck, anchor)) = current.run.stuck.iter().find_map(|s| {
+                s.blockers
+                    .iter()
+                    .map(|&b| (s.net, b))
+                    .chain(std::iter::once((s.net, usize::MAX)))
+                    .find(|pair| !tried.contains(pair))
+            }) else {
+                break;
+            };
+            tried.insert((stuck, anchor));
+
+            let mut order = current.order.clone();
+            order.retain(|&i| i != stuck);
+            let at = if anchor == usize::MAX {
+                0
+            } else {
+                order
+                    .iter()
+                    .position(|&i| i == anchor)
+                    .unwrap_or(order.len())
+            };
+            order.insert(at, stuck);
+
+            let run = self.route_with_order(board, &order);
+            // Keep any gain: more nets connected, or the same nets with less
+            // copper. Equal results are dropped so the budget is not spent
+            // re-finding the plan we already have.
+            let better = run.result.routed_nets.len() > current.run.result.routed_nets.len()
+                || (run.result.routed_nets.len() == current.run.result.routed_nets.len()
+                    && run.result.failed_nets != current.run.result.failed_nets);
+            if better {
+                let gained = run.result.routed_nets.len() > current.run.result.routed_nets.len();
+                current = Attempt { order, run };
+                if gained {
+                    // The blockers of the new plan are new information.
+                    tried.clear();
+                }
+            }
+        }
+
+        current.run.result
+    }
+
+    /// Route a board with one explicit net order (indices into `board.nets`).
+    ///
+    /// Exposed so a caller can reproduce or override the automatic ordering;
+    /// `route_board` calls this internally.
+    pub fn route_in_order(&self, board: &Board, order: &[usize]) -> RoutingResult {
+        self.route_with_order(board, order).result
+    }
+
+    /// Best result among several net orders, keeping the order that produced it.
+    fn best_of(&self, orders: Vec<Vec<usize>>, board: &Board) -> Attempt {
+        let mut best: Option<Attempt> = None;
+        for order in orders {
+            let run = self.route_with_order(board, &order);
+            let attempt = Attempt { order, run };
+            best = match best {
+                None => Some(attempt),
+                Some(current) => {
+                    let better = attempt.run.result.routed_nets.len()
+                        > current.run.result.routed_nets.len()
+                        || (attempt.run.result.routed_nets.len()
+                            == current.run.result.routed_nets.len()
+                            && attempt.run.result.total_length_mm
+                                < current.run.result.total_length_mm);
+                    Some(if better { attempt } else { current })
+                }
+            };
+            // A complete route cannot be beaten on net count, and reruns cost
+            // time, so stop as soon as everything is connected.
+            if best
+                .as_ref()
+                .is_some_and(|b| b.run.result.failed_nets.is_empty())
+            {
+                break;
+            }
+        }
+        best.unwrap_or_else(|| Attempt {
+            order: (0..board.nets.len()).collect(),
+            run: OrderRun {
+                result: RoutingResult::new(),
+                stuck: Vec::new(),
+            },
+        })
+    }
+
+
+    /// Deterministic net orderings to try, most useful first.
+    ///
+    /// No single order is right for every board: a wide power track laid first
+    /// can box in a signal net, while routing signals first can leave a ground
+    /// star unreachable. Trying a fixed, reproducible set and keeping the best
+    /// result is the honest alternative to tuning one order per board.
+    fn net_orders(&self, board: &Board) -> Vec<Vec<usize>> {
+        let n = board.nets.len();
+        let all: Vec<usize> = (0..n).collect();
         let mut orders: Vec<Vec<usize>> = Vec::new();
 
-        let by_priority = {
-            let mut o: Vec<usize> = (0..board.nets.len()).collect();
-            o.sort_by(|&a, &b| {
-                board.nets[a]
-                    .class
-                    .priority()
-                    .cmp(&board.nets[b].class.priority())
-                    .then_with(|| board.nets[a].name.cmp(&board.nets[b].name))
-            });
-            o
-        };
+        // 1. Class priority, then name — the original ordering.
+        let mut by_priority = all.clone();
+        by_priority.sort_by(|&a, &b| {
+            board.nets[a]
+                .class
+                .priority()
+                .cmp(&board.nets[b].class.priority())
+                .then_with(|| board.nets[a].name.cmp(&board.nets[b].name))
+        });
         orders.push(by_priority.clone());
 
+        // 2. The reverse.
         let mut reversed = by_priority.clone();
         reversed.reverse();
         orders.push(reversed);
 
-        // Ground and power last: signal nets claim the short paths first.
-        let mut signal_first: Vec<usize> = (0..board.nets.len()).collect();
+        // 3. Signals first, then power, ground last.
+        let mut signal_first = all.clone();
         signal_first.sort_by(|&a, &b| {
             let rank = |i: usize| match board.nets[i].class {
                 NetClass::Ground => 2,
@@ -201,40 +388,66 @@ impl Router {
         });
         orders.push(signal_first);
 
-        let mut best: Option<RoutingResult> = None;
-        for order in orders {
-            let candidate = self.route_with_order(board, &order);
-            best = match best {
-                None => Some(candidate),
-                Some(current) => {
-                    let better = candidate.routed_nets.len() > current.routed_nets.len()
-                        || (candidate.routed_nets.len() == current.routed_nets.len()
-                            && candidate.total_length_mm < current.total_length_mm);
-                    Some(if better { candidate } else { current })
-                }
+        // 4. Most constrained net first: a net with many terminals has the least
+        //    freedom, so it must claim its copper before the open board fills up.
+        let mut most_terminals_first = all.clone();
+        most_terminals_first.sort_by(|&a, &b| {
+            let ta = board.net_terminals(&board.nets[a]).len();
+            let tb = board.net_terminals(&board.nets[b]).len();
+            tb.cmp(&ta)
+                .then_with(|| board.nets[a].name.cmp(&board.nets[b].name))
+        });
+        orders.push(most_terminals_first.clone());
+
+        // 5. Ground and power first, signals last: the opposite of order 3, and
+        //    the right choice when the supply rails have the fewest options.
+        let mut rails_first = all.clone();
+        rails_first.sort_by(|&a, &b| {
+            let rank = |i: usize| match board.nets[i].class {
+                NetClass::Ground => 0,
+                NetClass::Power => 1,
+                _ => 2,
             };
-        }
-        best.unwrap_or_default()
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| {
+                    board.nets[a]
+                        .class
+                        .priority()
+                        .cmp(&board.nets[b].class.priority())
+                })
+                .then_with(|| board.nets[a].name.cmp(&board.nets[b].name))
+        });
+        orders.push(rails_first);
+
+        // 6. Terminals descending, but rails before signals among equals.
+        let mut mixed = most_terminals_first;
+        mixed.sort_by(|&a, &b| {
+            let ta = board.net_terminals(&board.nets[a]).len();
+            let tb = board.net_terminals(&board.nets[b]).len();
+            let rank = |i: usize| match board.nets[i].class {
+                NetClass::Ground => 0,
+                NetClass::Power => 1,
+                _ => 2,
+            };
+            tb.cmp(&ta)
+                .then_with(|| rank(a).cmp(&rank(b)))
+                .then_with(|| board.nets[a].name.cmp(&board.nets[b].name))
+        });
+        orders.push(mixed);
+
+        orders
     }
 
-    fn route_with_order(&self, board: &Board, order: &[usize]) -> RoutingResult {
+    fn route_with_order(&self, board: &Board, order: &[usize]) -> OrderRun {
         let mut result = RoutingResult::new();
-        let (minx, miny, maxx, maxy) = self.bounds;
+        let mut stuck: Vec<StuckNet> = Vec::new();
         let clearance = board.preset.min_clearance_mm;
 
-        // Cells occupied by copper, keyed to the owning net index.
-        let mut owner: HashMap<(i32, i32), usize> = HashMap::new();
-        let unassigned = usize::MAX;
-
-        // Pads are obstacles for every other net.
-        for (pos, size, net_name) in board.all_pads() {
-            let net = net_name
-                .as_deref()
-                .and_then(|n| board.nets.iter().position(|b| b.name == n))
-                .unwrap_or(unassigned);
-            let radius = (((size / 2.0) + clearance) / self.grid_mm).ceil() as i32;
-            self.stamp(&mut owner, self.cell(pos), radius.max(1), net);
-        }
+        // Copper must be judged with exact millimetre geometry: stamping
+        // clearance into whole grid cells rounds every obstacle up on four
+        // sides and leaves no channel at a 2.54 mm pad pitch.
+        let mut occupancy = Occupancy::new(board, &[]);
 
         for &index in order {
             let net = &board.nets[index];
@@ -254,87 +467,148 @@ impl Router {
                 continue;
             }
 
-            let mut connected: HashSet<(i32, i32)> = HashSet::new();
-            connected.insert(goals[0]);
-            let mut pending: Vec<(i32, i32)> = goals[1..].to_vec();
+            // A power rail is drawn 1 mm wide, but at a squeeze between two pads
+            // that width simply does not fit. So the class width is tried first
+            // and the net is narrowed only when it cannot pass at all, never
+            // below the process minimum. A narrower track still carries the
+            // current over a short gap.
+            let class_width = net.class.track_width_mm();
+            let min_width = board.preset.min_track_mm.clamp(0.05, class_width);
+            let mut widths = vec![class_width];
+            let mut w = class_width;
+            while w > min_width + 1e-9 {
+                w = (w * 0.7).max(min_width);
+                widths.push(w);
+            }
+            widths.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
             let mut net_segs: Vec<RouteSegment> = Vec::new();
-            let mut failure = None;
-            let mut passes = 0;
+            let mut failure: Option<String> = None;
+            let mut last_half = class_width / 2.0;
+            let mut last_target: Option<(i32, i32)> = None;
 
-            while !pending.is_empty() {
-                if passes >= goals.len() + 4 {
-                    failure = Some(format!("gave up after {passes} passes"));
-                    break;
-                }
-                passes += 1;
+            for width in widths {
+                // Half the track's own width: the centre line plus half a track
+                // must clear every obstruction, and the copper edge must clear
+                // the board outline by the process edge clearance.
+                let half = width / 2.0;
+                last_half = half;
 
-                // Nearest pending terminal to the connected group, ties broken by
-                // coordinates so repeated runs produce identical output.
-                let target = *pending
-                    .iter()
-                    .min_by(|a, b| {
-                        let da = connected
-                            .iter()
-                            .map(|c| mdist(**a, *c))
-                            .min()
-                            .unwrap_or(i32::MAX);
-                        let db = connected
-                            .iter()
-                            .map(|c| mdist(**b, *c))
-                            .min()
-                            .unwrap_or(i32::MAX);
-                        da.cmp(&db)
-                            .then_with(|| a.0.cmp(&b.0))
-                            .then_with(|| a.1.cmp(&b.1))
-                    })
-                    .expect("pending is non-empty");
+                // Clearance tests run once per cell here and are reused for every
+                // terminal of this net. The net's own copper is never an obstacle
+                // to itself, so the map stays valid while it is routed.
+                let grid = self.cost_grid(&occupancy, index, board, half, clearance);
 
-                match self.astar(
-                    target,
-                    &connected,
-                    &owner,
-                    index,
-                    board,
-                    (minx, miny, maxx, maxy),
-                ) {
-                    None => {
-                        failure = Some(format!(
-                            "no path from terminal at ({:.1}, {:.1}) mm",
-                            target.0 as f64 * self.grid_mm,
-                            target.1 as f64 * self.grid_mm
-                        ));
+                let mut connected: HashSet<(i32, i32)> = HashSet::new();
+                connected.insert(goals[0]);
+                let mut pending: Vec<(i32, i32)> = goals[1..].to_vec();
+                let mut attempt_segs: Vec<RouteSegment> = Vec::new();
+                let mut reason: Option<String> = None;
+                let mut passes = 0;
+
+                while !pending.is_empty() {
+                    if passes >= goals.len() + 4 {
+                        reason = Some(format!("gave up after {passes} passes"));
                         break;
                     }
-                    Some(path) => {
-                        for cell in &path {
-                            connected.insert(*cell);
-                        }
-                        net_segs.extend(self.path_to_segments(&path, &net.name, net.class));
+                    passes += 1;
 
-                        // Reserve the copper plus clearance for later nets.
-                        let radius = (((net.class.track_width_mm() / 2.0) + clearance)
-                            / self.grid_mm)
-                            .ceil() as i32;
-                        for cell in &path {
-                            self.stamp(&mut owner, *cell, radius.max(1), index);
-                        }
+                    // Nearest pending terminal to the connected group, ties
+                    // broken by coordinates so repeated runs are identical.
+                    let target = *pending
+                        .iter()
+                        .min_by(|a, b| {
+                            let da = connected
+                                .iter()
+                                .map(|c| mdist(**a, *c))
+                                .min()
+                                .unwrap_or(i32::MAX);
+                            let db = connected
+                                .iter()
+                                .map(|c| mdist(**b, *c))
+                                .min()
+                                .unwrap_or(i32::MAX);
+                            da.cmp(&db)
+                                .then_with(|| a.0.cmp(&b.0))
+                                .then_with(|| a.1.cmp(&b.1))
+                        })
+                        .expect("pending is non-empty");
+                    last_target = Some(target);
 
-                        pending.retain(|p| !connected.contains(p));
+                    match self.astar(target, &connected, &grid) {
+                        None => {
+                            let at = self.point(target);
+                            reason = Some(format!(
+                                "no path from terminal at ({:.1}, {:.1}) mm",
+                                at.0, at.1
+                            ));
+                            break;
+                        }
+                        Some(path) => {
+                            for cell in &path {
+                                connected.insert(*cell);
+                            }
+                            attempt_segs.extend(self.path_to_segments(
+                                &path,
+                                &net.name,
+                                net.class,
+                                width,
+                            ));
+                            pending.retain(|p| !connected.contains(p));
+                        }
                     }
                 }
+
+                if reason.is_none() {
+                    net_segs = attempt_segs;
+                    break;
+                }
+                failure = reason;
             }
 
-            if let Some(reason) = failure {
+            if net_segs.is_empty() {
+                // Find out who walled the terminal in, so the caller can rip
+                // those nets up and try again.
+                if let Some(target) = last_target {
+                    let at = self.point(target);
+                    let (_, blockers) = occupancy.blocking_nets(
+                        at,
+                        last_half,
+                        clearance,
+                        index,
+                        self.grid_mm,
+                        200_000,
+                    );
+                    stuck.push(StuckNet {
+                        net: index,
+                        blockers,
+                    });
+                }
                 // Report the diagnostics but do not emit partially connected copper.
-                result.failed_nets.push(format!("{}: {}", net.name, reason));
+                result.failed_nets.push(format!(
+                    "{}: {}",
+                    net.name,
+                    failure.unwrap_or_else(|| "no path".into())
+                ));
             } else {
+                // The new copper becomes an obstacle for later nets.
+                for seg in &net_segs {
+                    occupancy.add_track(
+                        seg.x1_mm,
+                        seg.y1_mm,
+                        seg.x2_mm,
+                        seg.y2_mm,
+                        seg.width_mm / 2.0,
+                        index,
+                    );
+                }
                 result.routed_nets.push(net.name.clone());
                 result.total_length_mm += net_segs.iter().map(|s| s.length_mm()).sum::<f64>();
                 result.segments.extend(net_segs);
             }
         }
 
-        result
+        OrderRun { result, stuck }
     }
 
     /// Collapse a grid path into maximal straight segments.
@@ -343,6 +617,7 @@ impl Router {
         path: &[(i32, i32)],
         net: &str,
         class: NetClass,
+        width_mm: f64,
     ) -> Vec<RouteSegment> {
         let mut segs = Vec::new();
         if path.len() < 2 {
@@ -359,106 +634,207 @@ impl Router {
                 j += 1;
             }
             let (x2, y2) = path[j];
-            segs.push(RouteSegment::new(
-                x1 as f64 * self.grid_mm,
-                y1 as f64 * self.grid_mm,
-                x2 as f64 * self.grid_mm,
-                y2 as f64 * self.grid_mm,
-                net,
-                class,
-            ));
+            segs.push(
+                RouteSegment::new(
+                    x1 as f64 * self.grid_mm,
+                    y1 as f64 * self.grid_mm,
+                    x2 as f64 * self.grid_mm,
+                    y2 as f64 * self.grid_mm,
+                    net,
+                    class,
+                )
+                .with_width(width_mm),
+            );
             i = j;
         }
         segs
+    }
+
+    /// Which cells `net_index` may occupy at `half` width, and what entering
+    /// each cell costs.
+    ///
+    /// Built once per net and width and reused for every terminal of that net:
+    /// a net's own copper never blocks itself, so the map cannot go stale while
+    /// that net is being routed.
+    fn cost_grid(
+        &self,
+        occupancy: &Occupancy,
+        net_index: usize,
+        board: &Board,
+        half: f64,
+        clearance: f64,
+    ) -> CostGrid {
+        let (minx, miny, maxx, maxy) = self.bounds;
+        let w = (maxx - minx + 1).max(1) as usize;
+        let h = (maxy - miny + 1).max(1) as usize;
+
+        // Distance at which a neighbouring net starts to cost extra: close
+        // enough to couple, far enough not to matter for a well-spaced board.
+        let isolation_mm = 1.2;
+        // Beyond this much free room a cell is "roomy enough" and costs nothing.
+        let slack_cap_mm = 1.5;
+        let own_class = board.nets[net_index].class;
+
+        let mut step = vec![f32::INFINITY; w * h];
+        for y in miny..=maxy {
+            for x in minx..=maxx {
+                let c = (x, y);
+                let i = (y - miny) as usize * w + (x - minx) as usize;
+                let mut cost = 1.0_f32;
+                if self.penalty_zones.contains(&c) {
+                    cost *= self.penalty_weight;
+                }
+                let p = self.point(c);
+                if !occupancy.allows(p, half, clearance, net_index) {
+                    continue;
+                }
+                // A route squeezed through the tightest possible gap is short but
+                // leaves nothing for the nets routed after it. Prefer roomy
+                // channels: this is what lets a single-layer board close.
+                let slack = occupancy.slack(p, half, clearance, net_index, slack_cap_mm);
+                cost += (3.0 * (slack_cap_mm - slack) / slack_cap_mm) as f32;
+                // Audio isolation: prefer not to run alongside a rail or an
+                // output track of a different class (ТЗ 5.2).
+                if let Some(other) = occupancy.foreign_within(p, isolation_mm, net_index) {
+                    cost += proximity_cost(own_class, board.nets[other].class) as f32;
+                }
+                step[i] = cost;
+            }
+        }
+
+        CostGrid {
+            w,
+            h,
+            minx,
+            miny,
+            step,
+        }
     }
 
     fn astar(
         &self,
         start: (i32, i32),
         goals: &HashSet<(i32, i32)>,
-        owner: &HashMap<(i32, i32), usize>,
-        net_index: usize,
-        board: &Board,
-        bounds: (i32, i32, i32, i32),
+        grid: &CostGrid,
     ) -> Option<Vec<(i32, i32)>> {
-        let (minx, miny, maxx, maxy) = bounds;
-        let own_class = board.nets[net_index].class;
-        let heuristic =
-            |p: (i32, i32)| goals.iter().map(|g| mdist(p, *g)).min().unwrap_or(0) as f64;
+        if !grid.inside(start) {
+            return None;
+        }
 
+        let cells = grid.step.len();
+
+        // Exact distance to the nearest goal on an otherwise empty board, by BFS
+        // from all goals at once. Scanning the grid here is what lets the search
+        // itself run on plain arrays instead of hash maps.
+        let mut guess = vec![f32::INFINITY; cells];
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        for g in goals {
+            if !grid.inside(*g) {
+                continue;
+            }
+            let i = grid.flat(*g);
+            if guess[i] == 0.0 {
+                continue;
+            }
+            guess[i] = 0.0;
+            queue.push_back(i);
+        }
+        while let Some(i) = queue.pop_front() {
+            let d = guess[i] + 1.0;
+            let c = grid.point(i);
+            for nb in [
+                (c.0 + 1, c.1),
+                (c.0 - 1, c.1),
+                (c.0, c.1 + 1),
+                (c.0, c.1 - 1),
+            ] {
+                if !grid.inside(nb) {
+                    continue;
+                }
+                let ni = grid.flat(nb);
+                if d < guess[ni] {
+                    guess[ni] = d;
+                    queue.push_back(ni);
+                }
+            }
+        }
+        let unreachable = f32::MAX / 8.0;
+        for value in guess.iter_mut() {
+            if !value.is_finite() {
+                *value = unreachable;
+            }
+        }
+
+        let mut is_goal = vec![false; cells];
+        for g in goals {
+            if grid.inside(*g) {
+                let i = grid.flat(*g);
+                is_goal[i] = true;
+            }
+        }
+
+        let mut distance = vec![f32::INFINITY; cells];
+        let mut came = vec![u32::MAX; cells];
+        let start_cell = grid.flat(start);
+        distance[start_cell] = 0.0;
         let mut open = BinaryHeap::new();
-        let mut came: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
-        let mut cost: HashMap<(i32, i32), f64> = HashMap::new();
-        cost.insert(start, 0.0);
         open.push(Node {
-            total: heuristic(start),
-            point: start,
+            g: 0.0,
+            total: guess[start_cell],
+            cell: start_cell,
         });
 
-        let limit = 2_000_000usize;
-        for _ in 0..limit {
-            let node = open.pop()?;
-            if goals.contains(&node.point) {
-                let mut path = vec![node.point];
-                while let Some(&prev) = came.get(&path[path.len() - 1]) {
-                    path.push(prev);
-                    if prev == start {
+        while let Some(node) = open.pop() {
+            // Stale heap entry: a shorter route to this cell was already found.
+            if node.g > distance[node.cell] {
+                continue;
+            }
+            if is_goal[node.cell] {
+                let mut path = Vec::new();
+                let mut at = node.cell;
+                loop {
+                    path.push(grid.point(at));
+                    if at == start_cell {
                         break;
                     }
+                    let prev = came[at];
+                    if prev == u32::MAX {
+                        return None;
+                    }
+                    at = prev as usize;
                 }
                 path.reverse();
                 return Some(path);
             }
 
-            let (x, y) = node.point;
-            let here = cost[&node.point];
-            for next in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
-                if next.0 < minx || next.1 < miny || next.0 > maxx || next.1 > maxy {
+            let c = grid.point(node.cell);
+            for nb in [
+                (c.0 + 1, c.1),
+                (c.0 - 1, c.1),
+                (c.0, c.1 + 1),
+                (c.0, c.1 - 1),
+            ] {
+                if !grid.inside(nb) {
                     continue;
                 }
-                if self.blocked.contains(&next) {
+                let ni = grid.flat(nb);
+                // A terminal of this net is always reachable, even if another
+                // net's pad sits within clearance of it: refusing it would make a
+                // routable net fail for no real reason.
+                let step = if is_goal[ni] { 1.0 } else { grid.step[ni] };
+                if !step.is_finite() {
                     continue;
                 }
-                // Another net's copper (pads or tracks) is a hard obstacle.
-                match owner.get(&next) {
-                    Some(&o) if o != net_index && o != usize::MAX => continue,
-                    _ => {}
+                let reached = node.g + step;
+                if reached < distance[ni] {
+                    distance[ni] = reached;
+                    came[ni] = node.cell as u32;
+                    open.push(Node {
+                        g: reached,
+                        total: reached + guess[ni],
+                        cell: ni,
+                    });
                 }
-                // An unassigned pad blocks everything except itself being a goal.
-                if owner.get(&next) == Some(&usize::MAX) && !goals.contains(&next) {
-                    continue;
-                }
-
-                let mut step = 1.0;
-                if self.penalty_zones.contains(&next) {
-                    step *= 5.0;
-                }
-                // Audio isolation: discourage running alongside incompatible nets.
-                for nb in [
-                    (next.0 + 1, next.1),
-                    (next.0 - 1, next.1),
-                    (next.0, next.1 + 1),
-                    (next.0, next.1 - 1),
-                ] {
-                    if let Some(&o) = owner.get(&nb) {
-                        if o != net_index && o != usize::MAX {
-                            step += proximity_cost(own_class, board.nets[o].class);
-                        }
-                    }
-                }
-
-                let nd = here + step;
-                if let Some(&c) = cost.get(&next) {
-                    if nd >= c {
-                        continue;
-                    }
-                }
-                cost.insert(next, nd);
-                came.insert(next, node.point);
-                open.push(Node {
-                    total: nd + heuristic(next),
-                    point: next,
-                });
             }
         }
         None
@@ -689,7 +1065,10 @@ mod tests {
     fn penalty_zone_is_passable_but_avoided() {
         let b = two_pad_board();
         let straight = Router::new(0.5, b.width_mm, b.height_mm).route_board(&b);
+        // A strong zone so the avoidance is unambiguous at this small scale;
+        // the default weight is gentler so dense boards still close.
         let mut router = Router::new(0.5, b.width_mm, b.height_mm);
+        router.penalty_weight = 8.0;
         // Cover the direct route with a soft zone.
         router.add_penalty_circle(25.0, 17.0, 6.0);
         let detoured = router.route_board(&b);

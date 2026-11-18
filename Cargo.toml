@@ -1,6 +1,6 @@
 [package]
 name = "amproute-studio"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Autorouter and 2D board viewer for single-layer THT audio amplifier PCBs made with the LUT (toner-transfer) method"
@@ -34,6 +34,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Errors
 anyhow = "1.0"
+# File dialogs in GUI
+rfd = "0.14"
 
 [profile.release]
 opt-level = "z"

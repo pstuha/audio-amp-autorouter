@@ -1,6 +1,9 @@
 /target
 /output
 /dist
+/kicad_out
+/drc.json
+*.rpt
 **/*.rs.bk
 *.pdb
 *.ilk

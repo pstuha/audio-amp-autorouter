@@ -1,14 +1,18 @@
 //! AmpRoute Studio — professional 2-D board viewer and router front-end.
 //!
-//! Layout: menu bar, left inspector (nets + components), central board canvas
-//! with zoom/pan, right statistics/DRC panel, bottom status bar.
+//! Layout: menu bar, left inspector (board picker + nets + components), central
+//! board canvas with zoom/pan, right statistics/DRC panel, bottom status bar.
 
 use crate::board::{Board, NetClass};
+use crate::boards::BOARD_SPECS;
 use crate::export;
-use crate::placement::PlacementResult;
+use crate::import;
+use crate::kicad;
 use crate::router::{RouteSegment, Router, RoutingResult};
+use crate::thermal::{self, ThermalParams};
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, Rect, RichText, Stroke, Vec2};
+use std::path::PathBuf;
 
 /// Persistent application state.
 pub struct AmpRouteApp {
@@ -22,10 +26,20 @@ pub struct AmpRouteApp {
     show_grid: bool,
     show_copper: bool,
     show_thermal: bool,
+    show_heatmap: bool,
     selected_net: Option<String>,
     status: String,
     grid_mm: f64,
     routing_ms: f64,
+    thermal_field: Option<thermal::ThermalField>,
+    file_path: Option<PathBuf>,
+    board_spec_index: Option<usize>,
+}
+
+/// Run the thermal simulation for a board with its own heat sources.
+fn simulate(board: &Board) -> thermal::ThermalField {
+    let sources = thermal::sources_for(board);
+    thermal::solve(board, &sources, &ThermalParams::default())
 }
 
 impl AmpRouteApp {
@@ -42,9 +56,9 @@ impl AmpRouteApp {
         visuals.selection.bg_fill = Color32::from_rgb(60, 120, 85);
         cc.egui_ctx.set_visuals(visuals);
 
-        let placement = PlacementResult::auto_amplifier();
-        let board = placement.board;
+        let board = (BOARD_SPECS[0].build)();
         let grid_mm = board.preset.grid_mm;
+        let thermal_field = simulate(&board);
         let mut app = Self {
             result: RoutingResult::new(),
             drc: Vec::new(),
@@ -56,16 +70,19 @@ impl AmpRouteApp {
             show_grid: true,
             show_copper: true,
             show_thermal: false,
+            show_heatmap: false,
             selected_net: None,
             status: "Ready — press Route (F5) to autoroute the board".into(),
             grid_mm,
             routing_ms: 0.0,
+            thermal_field: Some(thermal_field),
+            file_path: None,
+            board_spec_index: Some(0),
         };
         app.route();
         app
     }
 
-    /// Run the router on the current board and update the diagnostics panels.
     fn route(&mut self) {
         let started = std::time::Instant::now();
         let mut router = Router::new(self.grid_mm, self.board.width_mm, self.board.height_mm);
@@ -82,11 +99,12 @@ impl AmpRouteApp {
 
         // Diagnostics: structural validation plus component placement checks.
         let mut issues = self.board.validate();
-        let placement = PlacementResult {
+        issues.extend(crate::placement::PlacementResult {
             board: self.board.clone(),
-        };
-        issues.extend(placement.drc_report(self.board.preset.min_clearance_mm));
+        }.drc_report(self.board.preset.min_clearance_mm));
         self.drc = issues;
+
+        self.thermal_field = Some(simulate(&self.board));
 
         self.status = if self.result.failed_nets.is_empty() {
             format!(
@@ -107,6 +125,20 @@ impl AmpRouteApp {
         };
     }
 
+    fn export_kicad(&mut self) {
+        let fab = kicad::FabOptions::default();
+        let name = self.board.name.replace(' ', "_").to_lowercase();
+        let path = format!("{name}.kicad_pcb");
+        match kicad::write_kicad_pcb(&self.board, &self.result, &fab, &path) {
+            Ok(()) => {
+                self.status = format!("Exported KiCad board to {path}");
+            }
+            Err(e) => {
+                self.status = format!("KiCad export failed — {e}");
+            }
+        }
+    }
+
     fn export_all(&mut self) {
         match export::write_all(&self.board, &self.result, "output") {
             Ok(files) => {
@@ -118,6 +150,50 @@ impl AmpRouteApp {
             }
             Err(e) => self.status = format!("Export blocked — {e}"),
         }
+    }
+
+    fn load_board_spec(&mut self, idx: usize) {
+        if idx >= BOARD_SPECS.len() {
+            return;
+        }
+        self.board = (BOARD_SPECS[idx].build)();
+        self.grid_mm = self.board.preset.grid_mm;
+        self.board_spec_index = Some(idx);
+        self.file_path = None;
+        self.selected_net = None;
+        self.zoom = 3.2;
+        self.pan = Vec2::new(40.0, 40.0);
+        self.route();
+    }
+
+    fn load_from_file(&mut self, path: PathBuf) {
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("Cannot read {}: {e}", path.display());
+                return;
+            }
+        };
+        // Try JSON first (our own format), then KiCad PCB.
+        let board = if data.trim_start().starts_with('{') {
+            Board::from_json(&data).ok()
+        } else {
+            None
+        }.or_else(|| import::import_kicad_pcb(&data).ok().map(|r| r.board));
+
+        let Some(board) = board else {
+            self.status = "Failed to parse file as JSON or KiCad PCB".into();
+            return;
+        };
+
+        self.board = board;
+        self.grid_mm = self.board.preset.grid_mm;
+        self.board_spec_index = None;
+        self.file_path = Some(path);
+        self.selected_net = None;
+        self.zoom = 3.2;
+        self.pan = Vec2::new(40.0, 40.0);
+        self.route();
     }
 
     fn net_color(&self, name: &str) -> Color32 {
@@ -138,6 +214,30 @@ impl AmpRouteApp {
             rect.min.x + self.pan.x + p.0 as f32 * self.zoom,
             rect.min.y + self.pan.y + p.1 as f32 * self.zoom,
         )
+    }
+
+    fn draw_heatmap(&self, painter: &egui::Painter, rect: Rect) {
+        let Some(field) = &self.thermal_field else { return };
+        if field.peak_rise_c <= 0.0 {
+            return;
+        }
+
+        let cell = field.cell_mm as f32 * self.zoom;
+        let origin = self.to_screen(rect, (0.0, 0.0));
+
+        // One translucent quad per cell, coloured by the solved temperature rise.
+        for row in 0..field.rows {
+            for col in 0..field.cols {
+                let rise = field.temps[row * field.cols + col] as f64;
+                if rise <= 0.0 {
+                    continue;
+                }
+                let (r, g, b) = thermal::colour_for_rise(rise);
+                let tint = Color32::from_rgba_unmultiplied(r, g, b, 150);
+                let min = Pos2::new(origin.x + col as f32 * cell, origin.y + row as f32 * cell);
+                painter.rect_filled(Rect::from_min_size(min, Vec2::splat(cell)), 0.0, tint);
+            }
+        }
     }
 
     fn draw_canvas(&mut self, ui: &mut egui::Ui) {
@@ -194,7 +294,12 @@ impl AmpRouteApp {
             }
         }
 
-        // Thermal and star-ground keepout zones.
+        // Heatmap (real thermal simulation).
+        if self.show_heatmap {
+            self.draw_heatmap(&painter, rect);
+        }
+
+        // Thermal and star-ground keepout zones (soft zones overlay).
         if self.show_thermal {
             for (x, y, r) in self.board.thermal_hotspots() {
                 let c = self.to_screen(rect, (x, y));
@@ -249,6 +354,24 @@ impl AmpRouteApp {
             }
         }
 
+        // Mounting holes.
+        if self.show_components {
+            for hole in &self.board.mounting_holes {
+                let c = self.to_screen(rect, (hole.x, hole.y));
+                let r = (hole.drill_mm as f32 / 2.0 + 1.2) * self.zoom;
+                painter.circle_stroke(
+                    c,
+                    r.max(2.0),
+                    Stroke::new(1.0_f32, Color32::from_rgb(180, 140, 90)),
+                );
+                painter.circle_filled(
+                    c,
+                    (hole.drill_mm as f32 / 2.0 * self.zoom).max(1.0),
+                    Color32::from_rgb(10, 16, 13),
+                );
+            }
+        }
+
         // Tracks.
         if self.show_copper {
             for seg in &self.result.segments {
@@ -260,7 +383,7 @@ impl AmpRouteApp {
                 }
                 let a = self.to_screen(rect, (seg.x1_mm, seg.y1_mm));
                 let b = self.to_screen(rect, (seg.x2_mm, seg.y2_mm));
-                let w = (seg.class.track_width_mm() as f32 * self.zoom).max(1.2);
+                let w = (seg.width_mm as f32 * self.zoom).max(1.2);
                 painter.line_segment([a, b], Stroke::new(w, col));
             }
         }
@@ -299,11 +422,45 @@ impl AmpRouteApp {
 
     fn left_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+
+        // Board picker.
+        ui.heading(RichText::new("Board").size(14.0).strong());
+        ui.separator();
+        egui::ComboBox::from_id_salt("board_picker")
+            .selected_text(
+                self.board_spec_index
+                    .map(|i| BOARD_SPECS[i].summary)
+                    .unwrap_or("Custom (loaded from file)"),
+            )
+            .show_ui(ui, |ui| {
+                for (i, spec) in BOARD_SPECS.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.board_spec_index == Some(i), spec.summary)
+                        .clicked()
+                    {
+                        self.load_board_spec(i);
+                        ui.close_menu();
+                    }
+                }
+            });
+
+        ui.add_space(4.0);
+        if ui.button("Open .kicad_pcb / JSON…").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("KiCad PCB", &["kicad_pcb"])
+                .add_filter("JSON", &["json"])
+                .pick_file()
+            {
+                self.load_from_file(path);
+            }
+        }
+
+        ui.add_space(8.0);
         ui.heading(RichText::new("Nets").size(14.0).strong());
         ui.separator();
         egui::ScrollArea::vertical()
             .id_salt("nets")
-            .max_height(ui.available_height() * 0.55)
+            .max_height(ui.available_height() * 0.45)
             .show(ui, |ui| {
                 let nets = self.board.nets.clone();
                 for net in &nets {
@@ -369,9 +526,17 @@ impl AmpRouteApp {
             self.board.width_mm, self.board.height_mm
         ));
         ui.label(format!("Components:  {}", self.board.footprints.len()));
+        ui.label(format!("Mounting holes: {}", self.board.mounting_holes.len()));
         ui.label(format!("Router time: {:.0} ms", self.routing_ms));
         ui.add_space(4.0);
         ui.add(egui::ProgressBar::new(pct / 100.0).text(format!("{pct:.0}% routed")));
+
+        // Peak temperature from simulation.
+        if let Some(field) = &self.thermal_field {
+            ui.add_space(4.0);
+            ui.label(format!("Peak ΔT:  {:.1} °C", field.peak_rise_c));
+            ui.label(format!("At:       ({:.1}, {:.1}) mm", field.peak_at.0, field.peak_at.1));
+        }
 
         ui.add_space(8.0);
         ui.heading(RichText::new("Checks").size(14.0).strong());
@@ -432,7 +597,8 @@ impl AmpRouteApp {
         ui.checkbox(&mut self.show_components, "Components");
         ui.checkbox(&mut self.show_pads, "Pads");
         ui.checkbox(&mut self.show_grid, "10 mm grid");
-        ui.checkbox(&mut self.show_thermal, "Thermal / star-ground");
+        ui.checkbox(&mut self.show_thermal, "Soft zones (thermal / star-ground)");
+        ui.checkbox(&mut self.show_heatmap, "Heatmap (real thermal sim)");
 
         if let Some(net) = &self.selected_net {
             ui.add_space(8.0);
@@ -466,14 +632,32 @@ impl eframe::App for AmpRouteApp {
         if ctx.input(|i| i.key_pressed(egui::Key::E) && i.modifiers.ctrl) {
             self.export_all();
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl) {
+            self.export_kicad();
+        }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Export all (Ctrl+E)").clicked() {
+                    if ui.button("Open .kicad_pcb / JSON…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("KiCad PCB", &["kicad_pcb"])
+                            .add_filter("JSON", &["json"])
+                            .pick_file()
+                        {
+                            self.load_from_file(path);
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Export KiCad PCB (Ctrl+K)").clicked() {
+                        self.export_kicad();
+                        ui.close_menu();
+                    }
+                    if ui.button("Export Gerber/All (Ctrl+E)").clicked() {
                         self.export_all();
                         ui.close_menu();
                     }
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -493,8 +677,9 @@ impl eframe::App for AmpRouteApp {
                     ui.checkbox(&mut self.show_copper, "Copper tracks");
                     ui.checkbox(&mut self.show_components, "Components");
                     ui.checkbox(&mut self.show_pads, "Pads");
-                    ui.checkbox(&mut self.show_grid, "Grid");
-                    ui.checkbox(&mut self.show_thermal, "Thermal overlay");
+                    ui.checkbox(&mut self.show_grid, "10 mm grid");
+                    ui.checkbox(&mut self.show_thermal, "Soft zones");
+                    ui.checkbox(&mut self.show_heatmap, "Heatmap");
                 });
                 ui.menu_button("Help", |ui| {
                     ui.label(RichText::new("AmpRoute Studio").strong());
@@ -503,8 +688,8 @@ impl eframe::App for AmpRouteApp {
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⬇ Export").clicked() {
-                        self.export_all();
+                    if ui.button("⬇ KiCad (.kicad_pcb)").clicked() {
+                        self.export_kicad();
                     }
                     if ui.button("⚡ Route (F5)").clicked() {
                         self.route();
@@ -528,14 +713,14 @@ impl eframe::App for AmpRouteApp {
 
         egui::SidePanel::left("inspector")
             .resizable(true)
-            .default_width(220.0)
+            .default_width(240.0)
             .show(ctx, |ui| {
                 self.left_panel(ui);
             });
 
         egui::SidePanel::right("stats")
             .resizable(true)
-            .default_width(230.0)
+            .default_width(250.0)
             .show(ctx, |ui| {
                 self.right_panel(ui);
             });
@@ -550,8 +735,8 @@ impl eframe::App for AmpRouteApp {
 pub fn run() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([900.0, 600.0])
+            .with_inner_size([1360.0, 860.0])
+            .with_min_inner_size([960.0, 640.0])
             .with_title("AmpRoute Studio"),
         ..Default::default()
     };
@@ -574,7 +759,7 @@ mod tests {
 
     #[test]
     fn auto_placement_routes_most_nets() {
-        let board = PlacementResult::auto_amplifier().board;
+        let board = (BOARD_SPECS[0].build)();
         let router = Router::new(0.5, board.width_mm, board.height_mm);
         let r = router.route_board(&board);
         let total = r.routed_nets.len() + r.failed_nets.len();
@@ -587,7 +772,7 @@ mod tests {
 
     #[test]
     fn segments_have_positive_length() {
-        let board = PlacementResult::auto_amplifier().board;
+        let board = (BOARD_SPECS[0].build)();
         let router = Router::new(0.5, board.width_mm, board.height_mm);
         let r = router.route_board(&board);
         assert!(r.segments.iter().all(|s| s.length_mm() > 0.0));

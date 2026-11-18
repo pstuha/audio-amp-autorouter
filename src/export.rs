@@ -61,7 +61,7 @@ pub fn write_gerber(board: &Board, result: &RoutingResult, path: &str) -> Result
 
     writeln!(f, "G04 Tracks*")?;
     for seg in &result.segments {
-        let w = seg.class.track_width_mm();
+        let w = seg.width_mm;
         let d = track_apertures
             .iter()
             .find(|(aw, _)| (aw - w).abs() < 1e-9)
@@ -157,7 +157,7 @@ pub fn write_svg(board: &Board, result: &RoutingResult, path: &str) -> Result<()
             r,
             g,
             b,
-            (seg.class.track_width_mm() * S).max(1.0)
+            (seg.width_mm * S).max(1.0)
         )?;
     }
     writeln!(f, "</g>")?;
@@ -257,7 +257,7 @@ pub fn write_pdf(board: &Board, result: &RoutingResult, path: &str) -> Result<()
             b as f32 / 255.0,
             None,
         )));
-        layer.set_outline_thickness(seg.class.track_width_mm() as f32 * 2.83);
+        layer.set_outline_thickness(seg.width_mm as f32 * 2.83);
         let line = Line::from_iter(vec![
             (
                 Point::new(Mm(seg.x1_mm as f32), Mm(seg.y1_mm as f32)),
@@ -376,7 +376,7 @@ pub fn write_lut_template(board: &Board, result: &RoutingResult, path: &str) -> 
     // Tracks, solid black at true width (copper is opaque on the template).
     layer.set_outline_color(Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)));
     for seg in &result.segments {
-        layer.set_outline_thickness(seg.class.track_width_mm() as f32);
+        layer.set_outline_thickness(seg.width_mm as f32);
         layer.add_line(Line::from_iter(vec![
             (
                 Point::new(Mm((ox + seg.x1_mm) as f32), Mm((oy + seg.y1_mm) as f32)),

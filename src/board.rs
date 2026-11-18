@@ -43,10 +43,14 @@ impl NetClass {
     }
 
     /// Copper width in millimetres.
+    ///
+    /// Kept within what a laser-iron transfer can actually hold: a 0.8 mm rail
+    /// carries the current of a small power amp comfortably, and a thinner one
+    /// still closes where a 1 mm track would not fit between two pads.
     pub fn track_width_mm(self) -> f64 {
         match self {
-            NetClass::Power | NetClass::Output => 1.0,
-            NetClass::Ground => 0.8,
+            NetClass::Power | NetClass::Output => 0.8,
+            NetClass::Ground => 0.6,
             NetClass::Signal | NetClass::Input | NetClass::Feedback => 0.4,
             NetClass::Bias | NetClass::Control => 0.4,
         }
@@ -262,6 +266,29 @@ impl Net {
     }
 }
 
+/// A non-plated mounting hole in the board outline.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MountingHole {
+    pub x: f64,
+    pub y: f64,
+    /// Drill diameter in millimetres.
+    pub drill_mm: f64,
+}
+
+impl MountingHole {
+    pub fn new(x: f64, y: f64, drill_mm: f64) -> Self {
+        Self { x, y, drill_mm }
+    }
+
+    /// Radius around the hole where copper must not go, in millimetres.
+    ///
+    /// Half the drill plus a full clearance band, so a track of any width the
+    /// process allows still keeps its distance from the hole wall.
+    pub fn copper_keepout_mm(&self) -> f64 {
+        self.drill_mm / 2.0 + 1.2
+    }
+}
+
 /// The whole board: outline, manufacturing preset, components and nets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Board {
@@ -271,6 +298,12 @@ pub struct Board {
     pub preset: LutPreset,
     pub footprints: Vec<Footprint>,
     pub nets: Vec<Net>,
+    /// Plated-through mechanical holes. Copper keeps its distance.
+    #[serde(default)]
+    pub mounting_holes: Vec<MountingHole>,
+    /// One-line description shown in the board picker.
+    #[serde(default)]
+    pub description: String,
 }
 
 impl Board {
@@ -282,11 +315,30 @@ impl Board {
             preset,
             footprints: Vec::new(),
             nets: Vec::new(),
+            mounting_holes: Vec::new(),
+            description: String::new(),
         }
     }
 
     pub fn add_footprint(&mut self, fp: Footprint) {
         self.footprints.push(fp);
+    }
+
+    pub fn add_mounting_hole(&mut self, hole: MountingHole) {
+        self.mounting_holes.push(hole);
+    }
+
+    /// Mounting holes in the four corners, `inset_mm` from each edge.
+    pub fn add_corner_holes(&mut self, inset_mm: f64, drill_mm: f64) {
+        let (w, h) = (self.width_mm, self.height_mm);
+        for (x, y) in [
+            (inset_mm, inset_mm),
+            (w - inset_mm, inset_mm),
+            (inset_mm, h - inset_mm),
+            (w - inset_mm, h - inset_mm),
+        ] {
+            self.add_mounting_hole(MountingHole::new(x, y, drill_mm));
+        }
     }
 
     pub fn add_net(&mut self, net: Net) {
@@ -327,15 +379,25 @@ impl Board {
     }
 
     /// Pads that dissipate power — used as thermal penalty sources (ТЗ 5.3).
+    ///
+    /// The radius is a soft hint: enough to nudge copper away from a hot part,
+    /// small enough that a dense single-layer board still closes.
     pub fn thermal_hotspots(&self) -> Vec<(f64, f64, f64)> {
         self.footprints
             .iter()
             .filter(|f| matches!(f.class, NetClass::Power | NetClass::Output))
             .map(|f| {
                 let (cx, cy) = f.center();
-                (cx, cy, (f.width_mm.max(f.height_mm) * 0.9).max(6.0))
+                (cx, cy, (f.width_mm.max(f.height_mm) * 0.5).clamp(3.0, 6.0))
             })
             .collect()
+    }
+
+    /// Copper-to-outline clearance for this process, in millimetres.
+    pub fn edge_clearance_mm(&self) -> f64 {
+        // The LUT process needs the same gap to the routed edge as between two
+        // tracks, with a floor so the board outline is never in doubt.
+        (self.preset.min_clearance_mm + 0.2).max(0.3)
     }
 
     /// Star-ground centre: gravity point of all ground pads (ТЗ 5.1).
@@ -418,6 +480,49 @@ impl Board {
                 issues.push(format!(
                     "{refdes}: duplicate reference designator ({count} footprints)"
                 ));
+            }
+        }
+
+        // Mounting holes must sit on the board, clear of the outline.
+        for (i, hole) in self.mounting_holes.iter().enumerate() {
+            if !(hole.x.is_finite() && hole.y.is_finite()) {
+                issues.push(format!("H{}: mounting hole position is not finite", i + 1));
+                continue;
+            }
+            let r = hole.drill_mm / 2.0;
+            if hole.x - r < 0.0
+                || hole.y - r < 0.0
+                || hole.x + r > self.width_mm
+                || hole.y + r > self.height_mm
+            {
+                issues.push(format!(
+                    "H{}: mounting hole at ({:.1}, {:.1}) mm is too close to the board edge",
+                    i + 1,
+                    hole.x,
+                    hole.y
+                ));
+            }
+            if hole.drill_mm <= 0.0 {
+                issues.push(format!("H{}: drill must be positive", i + 1));
+            }
+        }
+
+        // Copper too close to the outline fails a real DRC, so catch it here.
+        let edge_clearance = self.edge_clearance_mm();
+        for fp in &self.footprints {
+            for (i, pad) in fp.pads.iter().enumerate() {
+                let (px, py) = (fp.x + pad.x, fp.y + pad.y);
+                let r = pad.size_mm / 2.0;
+                let gap = (px - r)
+                    .min(py - r)
+                    .min(self.width_mm - px - r)
+                    .min(self.height_mm - py - r);
+                if gap < edge_clearance - 1e-9 {
+                    issues.push(format!(
+                        "{}.{}: pad is {:.2} mm from the board edge, needs {:.2} mm",
+                        fp.refdes, i, gap, edge_clearance
+                    ));
+                }
             }
         }
 
