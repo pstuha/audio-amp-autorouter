@@ -41,7 +41,17 @@ copper keep-out, copper clear of the board edge, every pad on exactly one net,
 input nets kept away from output and power nets.
 
 Every exported board passes KiCad's own DRC with **zero violations**
-(`kicad-cli pcb drc --severity-all`).
+(`kicad-cli pcb drc --severity-all`). The routed results are checked into
+[`boards/`](boards/) as `.kicad_pcb` files, one per test board, so you can open
+any of them in KiCad without building or running anything:
+
+```powershell
+kicad-cli pcb drc boards\classic_ltp.kicad_pcb --severity-all
+```
+
+To route your own board, generate the same kind of file with the GUI (`Ctrl+K`)
+or the CLI, open it in KiCad's PCB editor, and check it with that project's own
+DRC.
 
 ### GUI
 
