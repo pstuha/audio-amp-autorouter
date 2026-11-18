@@ -120,7 +120,7 @@ Requires Rust 1.75 or newer.
 
 ```bash
 cargo build --release      # target/release/amproute-studio.exe
-cargo test                 # 80 tests
+cargo test                 # 81 tests
 ```
 
 On Linux, install the usual GUI development packages (`libxkbcommon`,

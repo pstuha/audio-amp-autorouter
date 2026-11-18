@@ -112,7 +112,11 @@ fn load_board(path: &PathBuf) -> Result<amproute_studio::Board> {
             .map_err(|e| anyhow::anyhow!("invalid board JSON in {}: {e}", path.display()));
     }
 
-    let imported = amproute_studio::import_kicad_pcb_str(&data)
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Imported board".into());
+    let imported = amproute_studio::import_kicad_pcb_str_named(&data, &stem)
         .map_err(|e| anyhow::anyhow!("cannot import {}: {e}", path.display()))?;
     if !imported.report.warnings.is_empty() {
         eprintln!("Import notes for {}:", path.display());

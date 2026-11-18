@@ -30,7 +30,7 @@ ship with the program.
   dissipation into the board, because the heatsink is their thermal path.
 - **CLI**: `--list-boards`, `--board <id>`, `-i` accepting either format, and a
   `.kicad_pcb` written alongside the Gerber set.
-- 80 tests: unit tests plus acceptance tests for all five boards.
+- 81 tests: unit tests plus acceptance tests for all five boards.
 - The routed results are checked into `boards/` as `.kicad_pcb` files, one per
   test board, so they can be opened and checked in KiCad without running the
   program.

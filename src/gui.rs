@@ -174,12 +174,22 @@ impl AmpRouteApp {
                 return;
             }
         };
-        // Try JSON first (our own format), then KiCad PCB.
+        // Try JSON first (our own format), then KiCad PCB. A KiCad board takes
+        // the file's name, so re-exporting it does not lose that.
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Imported board".into());
         let board = if data.trim_start().starts_with('{') {
             Board::from_json(&data).ok()
         } else {
             None
-        }.or_else(|| import::import_kicad_pcb(&data).ok().map(|r| r.board));
+        }
+        .or_else(|| {
+            import::import_kicad_pcb_str_named(&data, &stem)
+                .ok()
+                .map(|r| r.board)
+        });
 
         let Some(board) = board else {
             self.status = "Failed to parse file as JSON or KiCad PCB".into();

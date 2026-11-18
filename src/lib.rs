@@ -30,7 +30,9 @@ pub mod thermal;
 
 pub use board::{Board, Footprint, NetClass, Pad};
 pub use boards::{all_boards, build as build_board, default_board, BoardSpec, BOARD_SPECS};
-pub use import::{import_kicad_pcb, import_kicad_pcb_str, ImportReport, ImportedBoard};
+pub use import::{
+    import_kicad_pcb, import_kicad_pcb_str, import_kicad_pcb_str_named, ImportReport, ImportedBoard,
+};
 pub use placement::PlacementResult;
 pub use router::{RouteSegment, Router, RoutingResult};
 pub use thermal::{ThermalField, ThermalParams};

@@ -60,14 +60,26 @@ pub struct ImportedBoard {
 }
 
 /// Read a `.kicad_pcb` file into the board model.
+///
+/// The board takes the file's name, so an export of *your* board is called
+/// after it instead of the generic default.
 pub fn import_kicad_pcb(path: &str) -> anyhow::Result<ImportedBoard> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-    import_kicad_pcb_str(&text)
+    let name = std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Imported board".into());
+    import_kicad_pcb_str_named(&text, &name)
 }
 
 /// Read KiCad board text into the board model.
 pub fn import_kicad_pcb_str(text: &str) -> anyhow::Result<ImportedBoard> {
+    import_kicad_pcb_str_named(text, "Imported board")
+}
+
+/// Read KiCad board text, giving the board a name of the caller's choosing.
+pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<ImportedBoard> {
     let root = parse(text).map_err(|e| anyhow::anyhow!("not a valid KiCad S-expression: {e}"))?;
     if !root.is("kicad_pcb") {
         anyhow::bail!("file is not a KiCad PCB (root is not `kicad_pcb`)");
@@ -262,12 +274,7 @@ pub fn import_kicad_pcb_str(text: &str) -> anyhow::Result<ImportedBoard> {
         hole.y += offset_y;
     }
 
-    let name = std::path::Path::new("imported")
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "Imported board".into());
-
-    let mut board = Board::new(&name, width, height, LutPreset::reliable());
+    let mut board = Board::new(name, width, height, LutPreset::reliable());
     board.footprints = footprints;
     board.mounting_holes = mounting_holes;
 
@@ -557,5 +564,15 @@ mod tests {
         let router = crate::router::Router::new(0.5, board.width_mm, board.height_mm);
         let result = router.route_board(&board);
         assert_eq!(result.routed_nets.len(), 2, "both nets should route");
+    }
+
+    #[test]
+    fn a_named_import_keeps_the_name() {
+        // Re-exporting your own board must not rename it to a generic default.
+        let imported = import_kicad_pcb_str_named(SAMPLE, "my_preamp").unwrap();
+        assert_eq!(imported.board.name, "my_preamp");
+
+        let plain = import_kicad_pcb_str(SAMPLE).unwrap();
+        assert_eq!(plain.board.name, "Imported board");
     }
 }
