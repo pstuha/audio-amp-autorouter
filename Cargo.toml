@@ -1,6 +1,6 @@
 [package]
 name = "amproute-studio"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Agent-first autorouter and 2D board editor for LUT audio amplifier PCBs: KiCad DRC, Gerber/IPC-2581/ODB++, MCP"

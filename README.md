@@ -1,4 +1,4 @@
-# AmpRoute Studio 2.1.0
+# AmpRoute Studio 2.2.0
 
 **Agent-first autorouter and 2-D board editor for LUT audio-amplifier PCBs.**
 
@@ -200,10 +200,26 @@ docs/                               Agent API and roadmaps
 
 ## Bench validation
 
-`scripts\bench_validate.ps1` routes all 15 boards and checks `result.ok`.
-Bench numbers (gain, THD at 1 kHz, junction temperature) are device-dependent:
-**bench validation of an amplifier is currently blocked — no physical bench is
-available in this environment.**
+`scripts\bench_validate.ps1` routes all 15 boards and checks `result.ok`
+(routability smoke — also used in CI).
+
+**Bench validation of an amplifier is blocked — no physical bench is available
+in this environment.** When a bench is available, the full procedure is:
+
+1. **Routability smoke** — `scripts\bench_validate.ps1`: every board must print
+   `OK` and exit 0. Reference: `lm386-mini` → 4 files, `drc=0`, `kicad_drc_ran=true`.
+2. **Gain** — feed a 1 kHz sine (~0.1–1 Vpp) through the board's normal signal
+   path (input pin → front-end net → output pad) with a function generator and
+   a scope; compare with the board's class gain (net classes in the board JSON).
+3. **THD** — same path, measured with a spectrum/FFT analyzer at a few levels
+   (e.g., 0.1 / 1.0 × supply max); record %THD vs the class spec.
+4. **Temperature** — run the board at max supply/output for a few minutes;
+   measure with an IR camera or thermistor taps on the copper; keep the
+   junction rise within the model's thermal limits.
+
+Bench results become part of the record via `measure_currents` (then they
+gate `ok`) or explicit `analysis_policy` — see
+[`docs/agent-api.md`](docs/agent-api.md).
 
 ## Building
 

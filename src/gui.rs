@@ -118,6 +118,8 @@ pub struct AmpRouteApp {
     show: Appearance,
     dialog: Option<Dialog>,
     thermal_field: Option<ThermalField>,
+    /// Undo history of routing runs.
+    history: History,
     /// Size of the central panel, used by zoom-to-fit.
     canvas_size: Vec2,
 }
@@ -138,6 +140,40 @@ struct BoardStats {
     routed: usize,
     total: usize,
     nets: Vec<StatsRow>,
+}
+
+/// Undo history of routing runs: `past` holds earlier `RoutingResult`
+/// states, `future` the states undone but not yet redone.
+#[derive(Default)]
+struct History {
+    past: Vec<RoutingResult>,
+    future: Vec<RoutingResult>,
+}
+
+impl History {
+    fn clear(&mut self) {
+        self.past.clear();
+        self.future.clear();
+    }
+
+    fn push(&mut self, before: RoutingResult) {
+        self.future.clear();
+        self.past.push(before);
+    }
+
+    fn undo(&mut self, current: &mut RoutingResult) -> bool {
+        let Some(state) = self.past.pop() else { return false; };
+        self.future.push(std::mem::take(current));
+        *current = state;
+        true
+    }
+
+    fn redo(&mut self, current: &mut RoutingResult) -> bool {
+        let Some(state) = self.future.pop() else { return false; };
+        self.past.push(std::mem::take(current));
+        *current = state;
+        true
+    }
 }
 
 impl Default for Appearance {
@@ -181,6 +217,7 @@ impl AmpRouteApp {
             file_path: None,
             export_dir: None,
             copper: RoutingResult::new(),
+            history: History::default(),
             pipe: None,
             stage: Stage::Ready,
             status: "Open a board to begin".into(),
@@ -266,6 +303,7 @@ impl AmpRouteApp {
 
     fn reset_result(&mut self) {
         self.copper = RoutingResult::new();
+        self.history.clear();
         self.pipe = None;
         self.selection = None;
         self.stage = Stage::Ready;
@@ -331,6 +369,7 @@ impl AmpRouteApp {
         self.route_started = None;
         match result {
             Ok(pipe) => {
+                self.history.push(self.copper.clone());
                 self.copper = pipe.final_copper.clone();
                 self.thermal_field = Some(pipe.thermal.clone());
                 let nets = pipe.routing.result.routed_nets.len();
@@ -877,11 +916,15 @@ impl AmpRouteApp {
         let mut rotate_l = false;
         let mut rotate_r = false;
         let mut flip = false;
+        let mut undo = false;
+        let mut redo = false;
 
         ctx.input(|i| {
             if i.modifiers.ctrl && i.key_pressed(egui::Key::O) { open = true; }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::K) { export_kicad = true; }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::E) { export_all = true; }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::Z) { undo = true; }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::Y) { redo = true; }
             if i.key_pressed(egui::Key::F5) { route = true; }
             if i.key_pressed(egui::Key::Escape) { stop = true; }
             if i.key_pressed(egui::Key::Home) { fit = true; }
@@ -904,6 +947,12 @@ impl AmpRouteApp {
             self.view.flip = !self.view.flip;
             self.fit_view();
             flip = false;
+        }
+        if undo && self.history.undo(&mut self.copper) {
+            self.set_status("Route undone — Ctrl+Y to redo");
+        }
+        if redo && self.history.redo(&mut self.copper) {
+            self.set_status("Route redone");
         }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -1255,8 +1304,8 @@ impl AmpRouteApp {
             match dialog {
                 Dialog::About => {
                     egui::Window::new("About AmpRoute Studio").collapsible(false).resizable(false).show(ctx, |ui| {
-                        ui.label("AmpRoute Studio 2.1.0 — agent-first autorouter and 2-D board editor.");
-                        ui.label("Statistics panel, 15 reference boards · 100% routing · zero KiCad DRC violations.");
+                        ui.label("AmpRoute Studio 2.2.0 — agent-first autorouter and 2-D board editor.");
+                        ui.label("Statistics panel, Ctrl+Z / Ctrl+Y undo of routing runs — 15 reference boards · 100% routing · zero KiCad DRC violations.");
                         ui.label("LUT Gerber/1:1 template, IPC-2581, ODB++, CLI --json, MCP stdio.");
                         ui.label("MIT license · Rust + egui · github.com/pstuha/audio-amp-autorouter");
                         if ui.button("Close").clicked() { close = true; }
@@ -1270,6 +1319,7 @@ impl AmpRouteApp {
                             ("Ctrl+O", "Open a board"),
                             ("Ctrl+K", "Export .kicad_pcb"),
                             ("Ctrl+E", "Export Gerber / SVG / PDF / LUT template"),
+                            ("Ctrl+Z / Ctrl+Y", "Undo / redo the last routing run"),
                             ("R / Shift+R", "Rotate the view ±90°"),
                             ("F", "Mirror the board"),
                             ("Home", "Zoom to fit"),
@@ -1397,6 +1447,7 @@ mod tests {
             show: Appearance::default(),
             dialog: None,
             thermal_field: None,
+            history: History::default(),
             canvas_size: Vec2::new(800.0, 600.0),
         };
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
@@ -1405,5 +1456,32 @@ mod tests {
         let back = app.to_board(rect, screen);
         assert!((back.0 - point.0).abs() < 1e-3);
         assert!((back.1 - point.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn history_undo_redo_route_runs() {
+        let mut h = History::default();
+        let mut cur = RoutingResult::new();
+        assert!(cur.routed_nets.is_empty());
+
+        // First route run: previous state (empty copper) goes to `past`.
+        h.push(cur.clone());
+        cur.routed_nets.push("A".to_string());
+
+        assert!(h.undo(&mut cur));
+        assert!(cur.routed_nets.is_empty());
+        assert!(h.redo(&mut cur));
+        assert_eq!(cur.routed_nets, vec!["A".to_string()]);
+
+        // A new run after undo/redo pushes the current state again.
+        h.push(cur.clone());
+        assert_eq!(h.past.len(), 2);
+        cur.routed_nets.clear();
+
+        assert!(h.undo(&mut cur));
+        assert_eq!(cur.routed_nets, vec!["A".to_string()]);
+        assert!(h.undo(&mut cur));
+        assert!(cur.routed_nets.is_empty());
+        assert!(h.past.is_empty());
     }
 }

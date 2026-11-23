@@ -4,6 +4,18 @@ All notable changes to AmpRoute Studio are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-11-23
+
+Minor release: GUI Ctrl+Z / Ctrl+Y undo of routing runs, bench-validation procedure in README.
+
+- GUI: **Ctrl+Z / Ctrl+Y** — undo/redo the last routing run(s): restores the
+  previous routing result; a new route run clears the redo stack. Hotkeys
+  dialog and About updated.
+- GUI: `History` unit test for undo/redo of routing runs.
+- Docs: `README` "Bench validation" — routability smoke + physical procedure
+  (gain / THD / temperature) when a bench is available; BLOCKED offline.
+- Docs: `docs/router-roadmap.md` — bench note + 2.2.0 release line.
+
 ## [2.1.0] — 2026-11-23
 
 Minor release: CI workflow, honest quality verdicts, GUI statistics, MSRV fix.
