@@ -117,8 +117,8 @@ pub fn own_audit(board: &Board, routing: Option<&RoutingResult>) -> DrcReport {
     let pads = board.all_pads();
     for i in 0..pads.len() {
         let ((ax, ay), asize, anet) = pads[i].clone();
-        for j in (i + 1)..pads.len() {
-            let ((bx, by), bsize, bnet) = pads[j].clone();
+        for pad in pads.iter().skip(i + 1) {
+            let ((bx, by), bsize, bnet) = pad.clone();
             // Same conductor: nothing to check between its pads.
             if anet.is_some() && anet.as_deref() == bnet.as_deref() {
                 continue;

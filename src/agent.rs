@@ -515,8 +515,8 @@ impl AgentService {
     fn run_drc(&self, args: &Value) -> Result<Value, (i32, String)> {
         let board = Self::load_board(args)?;
         let report = crate::drc::audit(&board, None, None);
-        Ok(serde_json::to_value(&report)
-            .map_err(|e| (-32603, format!("cannot serialize DRC report: {e}")))?)
+        serde_json::to_value(&report)
+            .map_err(|e| (-32603, format!("cannot serialize DRC report: {e}")))
     }
 }
 

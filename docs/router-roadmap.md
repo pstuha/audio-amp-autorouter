@@ -136,7 +136,7 @@ KiCad DRC чист; однослойные эталоны не изменили�
       quality — отдельно, гейтится только при данных от агента.
 - [x] AC/EMI/thermal proxies + `QUALITY_SCHEMA_VERSION = "1.0"` в JSON.
 - [x] Экспорт: Excellon `vias.drl`, ODB++ каталог (matrix/steps/netlist/layers/drill),
-      IPC-2581 Rev B XML (Content/Dictionary/Netlist/Track/Drill), optional via CLI,
+      IPC-2581 Rev C XML (Content/Dictionary/Netlist/Track/Drill), optional via CLI,
       внутри `.kicad_pcb`), pickup-and-place / BOM — опционально.
 - [x] Gerber check в CI: парсинг RS-274X (header/format/apertures/D03) в unit-тестах export.rs;
       scale/orientation (сейчас только рекомендация в README).
@@ -155,16 +155,17 @@ KiCad DRC чист; однослойные эталоны не изменили�
 
 ## Финальная проверка (2026-11-22)
 
-- `cargo test`: 215 unit + приёмки 5 и 10 плат + e2e/MCP/reference — **0 провалов**.
+- `cargo test`: 248 тестов: 215 unit + приёмки (5 фикстурных + 10 агентских) + e2e/MCP/reference/quality/standards/two-layer — **0 провалов**.
 - `lm386-mini`: `ok=True`, 7/7 цепей, внутренний DRC = 0, `kicad-cli` DRC запускался,
   сегменты 127 → 62 после line-of-sight + фасок.
 - Скрин: `C:\Users\Pstuha\AppData\Local\Temp\opencode\final_standards.png`.
 - CAM: `--odb` пишет каталог `board.odb/` (matrix, steps/pcb/netlist, layers/top/bot, drill),
-  `--ipc` пишет IPC-2581 Rev B XML с Content/Dictionary/Netlist/Track/Drill.
+  `--ipc` пишет IPC-2581 Rev C XML с Content/Dictionary/Netlist/Track/Drill.
 - Визуальный аудит: **0 не-канонических сегментов** (проверка dx==0 || dy==0 ||
   |dx−dy|<0.01 по всем сегментам), никаких ступенек; 8-connected/octile по
   умолчанию + line-of-sight + разложение «последней мили» на 0°/45°/90° цепочки.
   DRC = 0, `kicad-cli` DRC запускался.
+- Релиз **2.0.0**: `git log -1` → `4665bd4` (main → origin/main), GitHub-описание обновлено.
 
 ## CAM-форматы и перемычки: финальное решение
 

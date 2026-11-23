@@ -209,7 +209,7 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
             // A pad with no net is either mechanical or unassigned.
             let net = pad_node
                 .child("net")
-                .and_then(|n| net_token(n))
+                .and_then(net_token)
                 .and_then(|token| resolve_net(&token, &net_codes));
 
             let index = pads.len();

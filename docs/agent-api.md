@@ -55,6 +55,9 @@ one response per line. Nothing is written to stdout except responses.
 | `generate_netlist` | same as `run_ac` | ngspice deck text |
 | `run_emi` | `board`/`path`, optional `emi` config | `EmiReport` (coupling dB, loop areas, violations) |
 | `run_thermal` | `board`/`path` | `TransientThermal` (junction estimate, τ, copper coverage) |
+| `optimize_placement` | `board` or `path` | THT placement candidates with 0/180 rotation and validation report |
+| `set_lut_profile` | `min_track_mm`, `min_clearance_mm` (optional) | LUT profile accepted/rejected per rules |
+| `suggest_jumpers` | `board` or `path` | Wire-jump endpoints of the routed board |
 
 Call a tool with `tools/call`:
 

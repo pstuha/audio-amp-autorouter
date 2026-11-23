@@ -171,7 +171,7 @@ impl AcReport {
 enum Element {
     Passive(String, String, C),
     VSource(String, C),
-    VCVS {
+    VcvS {
         a: String,
         b: String,
         p: String,
@@ -200,7 +200,7 @@ impl Circuit {
         let sources = self
             .elements
             .iter()
-            .filter(|e| matches!(e, Element::VSource(..) | Element::VCVS { .. }))
+            .filter(|e| matches!(e, Element::VSource(..) | Element::VcvS { .. }))
             .count();
         let size = n + sources;
         let mut a = vec![vec![C::new(0.0, 0.0); size]; size];
@@ -233,7 +233,7 @@ impl Circuit {
                     }
                     b[k] = *voltage;
                 }
-                Element::VCVS {
+                Element::VcvS {
                     a: pa,
                     b: pb,
                     p,
@@ -284,8 +284,8 @@ fn gaussian(mut a: Vec<Vec<C>>, mut b: Vec<C>) -> Option<Vec<C>> {
         a.swap(col, pivot);
         b.swap(col, pivot);
         let inv = C::new(1.0, 0.0) / a[col][col];
-        for j in col..n {
-            a[col][j] = a[col][j] * inv;
+        for cell in a[col].iter_mut().skip(col) {
+            *cell = *cell * inv;
         }
         b[col] = b[col] * inv;
         for row in 0..n {
@@ -325,10 +325,9 @@ fn parse_value(value: &str) -> Option<(char, f64)> {
         ('R', s)
     } else if let Some(s) = lower.strip_suffix('k') {
         ('R', s)
-    } else if let Some(s) = lower.strip_suffix('m') {
-        ('R', s)
     } else {
-        return None;
+        let s = lower.strip_suffix('m')?;
+        ('R', s)
     };
     let number = suffix.replace(',', ".");
     let base: f64 = number.parse().ok()?;
@@ -403,7 +402,7 @@ pub(crate) fn circuit_from_board(board: &Board, config: &AcConfig) -> (Circuit, 
                     if let (Some(p), Some(m), Some(out)) = (p, m, out) {
                         elements.push(Element::Passive(p.clone(), ground.clone(), C::new(1.0 / input_impedance_ohm, 0.0)));
                         elements.push(Element::Passive(m.clone(), ground.clone(), C::new(1.0 / input_impedance_ohm, 0.0)));
-                        elements.push(Element::VCVS {
+                        elements.push(Element::VcvS {
                             a: out,
                             b: ground.clone(),
                             p,

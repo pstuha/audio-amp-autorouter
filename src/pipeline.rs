@@ -414,7 +414,7 @@ pub fn run_pipeline(board: Board, config: PipelineConfig, out_dir: &str) -> Resu
             &sources,
             Some(&complete),
             &config.thermal_params,
-            thermal_field.peak_rise_c as f64,
+            thermal_field.peak_rise_c,
         ))
     } else {
         None

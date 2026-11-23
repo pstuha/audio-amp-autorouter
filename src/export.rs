@@ -573,7 +573,7 @@ pub fn write_excellon(board: &Board, result: &RoutingResult, path: &str) -> Resu
                 d.push(via.drill_mm);
             }
         }
-        d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        d.sort_by(|a, b| a.total_cmp(b));
         d
     };
     for (i, drill) in drills.iter().enumerate() {
@@ -581,7 +581,7 @@ pub fn write_excellon(board: &Board, result: &RoutingResult, path: &str) -> Resu
     }
     writeln!(f, "%")?;
     for via in &result.via_objects {
-        let tool = drills.iter().position(|d| (d - via.drill_mm).abs() < 1e-6).unwrap() + 1;
+        let tool = drills.iter().position(|d| (d - via.drill_mm).abs() < 1e-6).expect("drill tool exists") + 1;
         writeln!(f, "T{:02}", tool)?;
         writeln!(f, "X{:06.3}Y{:06.3}", via.x_mm, via.y_mm)?;
     }

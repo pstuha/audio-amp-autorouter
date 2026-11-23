@@ -15,16 +15,11 @@ use std::collections::{BinaryHeap, HashSet};
 
 /// Copper layer of a routed segment. Single-layer boards use `FCu`; the
 /// two-layer engine will emit `BCu` where it crosses with a via.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 pub enum CopperLayer {
+    #[default]
     FCu,
     BCu,
-}
-
-impl Default for CopperLayer {
-    fn default() -> Self {
-        Self::FCu
-    }
 }
 
 impl CopperLayer {
@@ -174,6 +169,11 @@ impl Ord for Node {
     fn cmp(&self, o: &Self) -> Ordering {
         o.total.partial_cmp(&self.total).unwrap_or(Ordering::Equal)
     }
+}
+
+struct ChamferCut {
+    p1: (f64, f64),
+    p2: (f64, f64),
 }
 
 fn mdist(a: (i32, i32), b: (i32, i32)) -> i32 {
@@ -799,7 +799,7 @@ impl Router {
             // Largest legal cut wins: a visible 45° chamfer where there is
             // room, a smaller one in tight channels, no cut at all if even
             // 0.25 mm would violate clearance.
-            let mut chosen: Option<(f64, (f64, f64), (f64, f64))> = None;
+            let mut chosen: Option<ChamferCut> = None;
             for wanted in [1.0_f64, 0.75, 0.5, 0.25] {
                 let cut = wanted.min(len_a * 0.3).min(len_b * 0.3);
                 if cut < 0.2 {
@@ -816,11 +816,11 @@ impl Router {
                 // Exact millimetre geometry along the whole diagonal, with a
                 // small process margin: endpoint samples are not enough.
                 if occupancy.allows_segment(p1, p2, half, clearance + 0.1, net) {
-                    chosen = Some((cut, p1, p2));
+                    chosen = Some(ChamferCut { p1, p2 });
                     break;
                 }
             }
-            let Some((_cut, p1, p2)) = chosen else {
+            let Some(ChamferCut { p1, p2, .. }) = chosen else {
                 out.push(clone_between(a, start, p));
                 start = p;
                 continue;
@@ -947,9 +947,9 @@ impl Router {
         if self.diagonal_search {
             // Octile distance is admissible for 8-connected movement.
             let goals_xy: Vec<(i32, i32)> = goals.iter().copied().collect();
-            for i in 0..cells {
+            for (i, slot) in guess.iter_mut().enumerate().take(cells) {
                 let c = grid.point(i);
-                guess[i] = goals_xy
+                *slot = goals_xy
                     .iter()
                     .map(|g| {
                         let dx = (c.0 - g.0).abs() as f32;

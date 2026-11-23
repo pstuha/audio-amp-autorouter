@@ -143,11 +143,11 @@ History and comparisons: [`docs/quality-roadmap.md`](docs/quality-roadmap.md),
 ## Verification
 
 ```text
-cargo test
-  215 unit tests
-  5-board acceptance + 10-board acceptance
-  e2e, MCP, reference, quality, standards, SPICE golden
-  → 0 failures
+cargo test — 248 tests, 0 failures:
+  215 unit + 5-board acceptance + 10-board acceptance
+  e2e, MCP, reference, quality, standards, two-layer, SPICE golden
+
+scripts\bench_validate.ps1 — routes all 15 boards, checks result.ok = true
 
 kicad-cli pcb drc --severity-all   # 0 violations on all 15 boards
 lm386-mini: 7/7 nets, non_canonical segments = 0

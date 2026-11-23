@@ -82,12 +82,18 @@ impl Sexpr {
             .collect()
     }
 
+}
+
+impl std::fmt::Display for Sexpr {
     /// Render back to text.
-    pub fn to_string(&self) -> String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = String::new();
         self.write_to(&mut out, 0);
-        out
+        f.write_str(&out)
     }
+}
+
+impl Sexpr {
 
     fn write_to(&self, out: &mut String, indent: usize) {
         match self {
