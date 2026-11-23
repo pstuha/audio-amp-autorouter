@@ -1,7 +1,7 @@
 //! Export writers: Gerber (RS-274X), SVG and PDF.
 
 use crate::board::{Board, NetClass};
-use crate::router::RoutingResult;
+use crate::router::{CopperLayer, RouteSegment, RoutingResult};
 use anyhow::Result;
 use printpdf::path::{PaintMode, WindingOrder};
 use printpdf::*;
@@ -12,7 +12,8 @@ fn gerber_units(mm: f64) -> i64 {
     (mm * 1_000_000.0).round() as i64
 }
 
-pub fn write_gerber(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
+/// Write one copper layer as Gerber RS-274X.
+fn write_gerber_layer(board: &Board, result: &RoutingResult, path: &str, layer: CopperLayer) -> Result<()> {
     let mut f = BufWriter::new(File::create(path)?);
     writeln!(f, "G04 AmpRoute Studio copper*")?;
     writeln!(f, "%FSLAX46Y46*%")?;
@@ -40,6 +41,18 @@ pub fn write_gerber(board: &Board, result: &RoutingResult, path: &str) -> Result
             ));
         }
     }
+    // Vias are flashed on both copper layers with their own aperture.
+    for via in &result.via_objects {
+        if !pad_apertures
+            .iter()
+            .any(|(asize, _)| (asize - via.diameter_mm).abs() < 1e-9)
+        {
+            pad_apertures.push((
+                via.diameter_mm,
+                (track_apertures.len() + pad_apertures.len() + 10) as u32,
+            ));
+        }
+    }
 
     for (w, d) in &track_apertures {
         writeln!(f, "%ADD{}C,{:.3}*%", d, w)?;
@@ -59,8 +72,8 @@ pub fn write_gerber(board: &Board, result: &RoutingResult, path: &str) -> Result
         writeln!(f, "X{}Y{}D03*", gerber_units(x), gerber_units(y))?;
     }
 
-    writeln!(f, "G04 Tracks*")?;
-    for seg in &result.segments {
+    writeln!(f, "G04 Tracks ({})*", layer.kicad_name())?;
+    for seg in result.segments.iter().filter(|s| s.layer == layer) {
         let w = seg.width_mm;
         let d = track_apertures
             .iter()
@@ -82,9 +95,37 @@ pub fn write_gerber(board: &Board, result: &RoutingResult, path: &str) -> Result
         )?;
     }
 
+    if !result.via_objects.is_empty() {
+        writeln!(f, "G04 Vias ({})*", layer.kicad_name())?;
+        for via in &result.via_objects {
+            let code = pad_apertures
+                .iter()
+                .find(|(asize, _)| (asize - via.diameter_mm).abs() < 1e-9)
+                .map(|(_, d)| *d)
+                .unwrap_or(track_apertures[0].1);
+            writeln!(f, "D{}*", code)?;
+            writeln!(
+                f,
+                "X{}Y{}D03*",
+                gerber_units(via.x_mm),
+                gerber_units(via.y_mm)
+            )?;
+        }
+    }
+
     writeln!(f, "M02*")?;
     f.flush()?;
     Ok(())
+}
+
+/// Front copper — `board.gbr`, the LUT stencil for a single-layer board.
+pub fn write_gerber(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
+    write_gerber_layer(board, result, path, CopperLayer::FCu)
+}
+
+/// Back copper, emitted only when a board actually uses two layers.
+pub fn write_gerber_back(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
+    write_gerber_layer(board, result, path, CopperLayer::BCu)
 }
 
 pub fn write_svg(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
@@ -144,7 +185,7 @@ pub fn write_svg(board: &Board, result: &RoutingResult, path: &str) -> Result<()
     }
     writeln!(f, "</g>")?;
 
-    writeln!(f, r#"<g stroke-linecap="round" fill="none">"#)?;
+    writeln!(f, r#"<g stroke-linecap="round" stroke-linejoin="round" fill="none">"#)?;
     for seg in &result.segments {
         let (r, g, b) = seg.class.rgb();
         writeln!(
@@ -177,18 +218,43 @@ pub fn write_svg(board: &Board, result: &RoutingResult, path: &str) -> Result<()
     }
     writeln!(f, "</g>")?;
 
+    if !result.via_objects.is_empty() {
+        writeln!(f, r##"<g stroke="#e8eef4" stroke-width="0.8">"##)?;
+        for via in &result.via_objects {
+            let (r, g, b) = via.class.rgb();
+            writeln!(
+                f,
+                r##"<circle cx="{}" cy="{}" r="{}" fill="#{:02x}{:02x}{:02x}"/>"##,
+                via.x_mm * S,
+                via.y_mm * S,
+                via.diameter_mm / 2.0 * S,
+                r,
+                g,
+                b
+            )?;
+            writeln!(
+                f,
+                r##"<circle cx="{}" cy="{}" r="{}" fill="#0a1224"/>"##,
+                via.x_mm * S,
+                via.y_mm * S,
+                via.drill_mm / 2.0 * S
+            )?;
+        }
+        writeln!(f, "</g>")?;
+    }
+
     writeln!(
         f,
-        r##"<g font-family="monospace" font-size="12" fill="#d8f5c8">"##
+        r##"<g font-family="monospace" font-size="3" fill="#d8f5c8">"##
     )?;
     writeln!(
         f,
-        r#"<text x="10" y="20">AmpRoute Studio — {} — {}x{}mm</text>"#,
+        r#"<text x="4" y="5">AmpRoute Studio — {} — {}x{}mm</text>"#,
         board.name, board.width_mm, board.height_mm
     )?;
     writeln!(
         f,
-        r#"<text x="10" y="36">routed {}/{} nets · {:.1}mm track</text>"#,
+        r#"<text x="4" y="10">routed {}/{} nets · {:.1}mm track</text>"#,
         result.routed_nets.len(),
         result.routed_nets.len() + result.failed_nets.len(),
         result.total_length_mm
@@ -321,12 +387,24 @@ pub fn write_all(board: &Board, result: &RoutingResult, dir: &str) -> Result<Vec
     let mut written = Vec::new();
     write_gerber(board, result, &format!("{}/board.gbr", dir))?;
     written.push(format!("{}/board.gbr", dir));
+    if result.segments.iter().any(|s| s.layer == CopperLayer::BCu) {
+        write_gerber_back(board, result, &format!("{}/board_b.gbr", dir))?;
+        written.push(format!("{}/board_b.gbr", dir));
+    }
+    if !result.via_objects.is_empty() {
+        write_excellon(board, result, &format!("{}/vias.drl", dir))?;
+        written.push(format!("{}/vias.drl", dir));
+    }
     write_svg(board, result, &format!("{}/board.svg", dir))?;
     written.push(format!("{}/board.svg", dir));
     write_pdf(board, result, &format!("{}/board.pdf", dir))?;
     written.push(format!("{}/board.pdf", dir));
     write_lut_template(board, result, &format!("{}/lut_print.pdf", dir))?;
     written.push(format!("{}/lut_print.pdf", dir));
+    if result.segments.iter().any(|s| s.layer == CopperLayer::BCu) {
+        write_lut_template_back(board, result, &format!("{}/lut_print_b.pdf", dir))?;
+        written.push(format!("{}/lut_print_b.pdf", dir));
+    }
     Ok(written)
 }
 
@@ -335,6 +413,211 @@ pub fn write_all(board: &Board, result: &RoutingResult, dir: &str) -> Result<Vec
 /// The page is sized to the board plus a 10 mm border; copper and pads are
 /// drawn at true scale so the sheet can be printed 100% (no "fit to page") and
 /// ironed directly. Mirrors nothing — use the SVG preview to flip if needed.
+/// Minimal ODB++-style net/topology profile for downstream CAM tools.
+pub fn write_odb_profile(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
+    use std::path::Path;
+    let root = Path::new(path);
+    let step = root.join("steps").join("pcb");
+    for dir in [
+        root.join("matrix"),
+        step.join("netlists"),
+        step.join("layers").join("top"),
+        step.join("layers").join("bot"),
+    ] {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let mut matrix = BufWriter::new(File::create(root.join("matrix").join("matrix"))?);
+    writeln!(matrix, "ODB++ 7.0")?;
+    writeln!(matrix, "UNITS=MM")?;
+    writeln!(matrix, "STEP=pcb")?;
+    writeln!(matrix, "LAYER=top TYPE=SIGNAL NAME=F.Cu")?;
+    writeln!(matrix, "LAYER=bot TYPE=SIGNAL NAME=B.Cu")?;
+    writeln!(matrix, "LAYER=profile TYPE=PROFILE NAME=Edge.Cuts")?;
+    matrix.flush()?;
+
+    let mut hdr = BufWriter::new(File::create(step.join("stephdr"))?);
+    writeln!(hdr, "STEP=pcb")?;
+    writeln!(hdr, "UNITS=MM")?;
+    writeln!(hdr, "SIZE={:.4} {:.4}", board.width_mm, board.height_mm)?;
+    hdr.flush()?;
+
+    let mut netlist = BufWriter::new(File::create(step.join("netlists").join("netlist"))?);
+    for net in &board.nets {
+        writeln!(netlist, "NET={} CLASS={}", net.name, net.class.label())?;
+        for node in &net.nodes {
+            writeln!(
+                netlist,
+                "NODE={} PAD={}",
+                node.refdes,
+                node.pad + 1
+            )?;
+        }
+    }
+    netlist.flush()?;
+
+    for (layer, name) in [(CopperLayer::FCu, "top"), (CopperLayer::BCu, "bot")] {
+        let mut features =
+            BufWriter::new(File::create(step.join("layers").join(name).join("features"))?);
+        for seg in result.segments.iter().filter(|s| s.layer == layer) {
+            writeln!(
+                features,
+                "L {:.4} {:.4} {:.4} {:.4} {:.4} 0",
+                seg.x1_mm,
+                seg.y1_mm,
+                seg.x2_mm,
+                seg.y2_mm,
+                seg.width_mm
+            )?;
+        }
+        features.flush()?;
+    }
+
+    let mut drill = BufWriter::new(File::create(step.join("drill"))?);
+    for via in &result.via_objects {
+        writeln!(
+            drill,
+            "VIA {:.4} {:.4} {:.4} 1",
+            via.x_mm, via.y_mm, via.drill_mm
+        )?;
+    }
+    drill.flush()?;
+    Ok(())
+}
+
+/// IPC-2581 Rev B style XML: content, dictionary, layer stack, netlist and
+/// routed geometry. Coordinates are millimetres, as in the rest of the tool.
+pub fn write_ipc2581_profile(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
+    let mut f = BufWriter::new(File::create(path)?);
+    writeln!(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")?;
+    writeln!(
+        f,
+        "<CadData xmlns=\"http://ipc.org/ipc2581/RevB\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:noNamespaceSchemaLocation=\"ipc2581.xsd\">"
+    )?;
+    writeln!(f, "  <Content units=\"mm\" schemaVersion=\"B\">")?;
+    writeln!(f, "    <PartNumber>{}</PartNumber>", board.name)?;
+    writeln!(f, "    <Title>AmpRoute Studio routed board</Title>")?;
+    writeln!(f, "  </Content>")?;
+    writeln!(f, "  <Dictionary>")?;
+    writeln!(
+        f,
+        "    <Units>mm</Units><LayerDef name=\"F.Cu\" layerType=\"CONDUCTOR\" layerNum=\"1\"/>"
+    )?;
+    writeln!(
+        f,
+        "    <LayerDef name=\"B.Cu\" layerType=\"CONDUCTOR\" layerNum=\"2\"/>"
+    )?;
+    writeln!(
+        f,
+        "    <LayerDef name=\"Profile\" layerType=\"PROFILE\" layerNum=\"0\"/>"
+    )?;
+    writeln!(f, "  </Dictionary>")?;
+    writeln!(
+        f,
+        "  <DesignRules><Clearance value=\"{:.4}\"/><MinTrack value=\"{:.4}\"/></DesignRules>",
+        board.preset.min_clearance_mm, board.preset.min_track_mm
+    )?;
+    writeln!(
+        f,
+        "  <Profile><Outline x0=\"0\" y0=\"0\" x1=\"{:.4}\" y1=\"{:.4}\"/></Profile>",
+        board.width_mm, board.height_mm
+    )?;
+    writeln!(f, "  <Netlist>")?;
+    for net in &board.nets {
+        writeln!(
+            f,
+            "    <Net name=\"{}\" netClass=\"{}\">",
+            net.name,
+            net.class.label()
+        )?;
+        for seg in result.segments.iter().filter(|s| s.net == net.name) {
+            writeln!(
+                f,
+                "      <Track layer=\"{}\" x1=\"{:.4}\" y1=\"{:.4}\" x2=\"{:.4}\" y2=\"{:.4}\" width=\"{:.4}\"/>",
+                seg.layer.kicad_name(),
+                seg.x1_mm,
+                seg.y1_mm,
+                seg.x2_mm,
+                seg.y2_mm,
+                seg.width_mm
+            )?;
+        }
+        writeln!(f, "    </Net>")?;
+    }
+    writeln!(f, "  </Netlist>")?;
+    if !result.via_objects.is_empty() {
+        writeln!(f, "  <Drill>")?;
+        for via in &result.via_objects {
+            writeln!(
+                f,
+                "    <Hole x=\"{:.4}\" y=\"{:.4}\" drill=\"{:.4}\" plated=\"true\"/>",
+                via.x_mm, via.y_mm, via.drill_mm
+            )?;
+        }
+        writeln!(f, "  </Drill>")?;
+    }
+    writeln!(f, "</CadData>")?;
+    f.flush()?;
+    Ok(())
+}
+
+/// Excellon drill file for plated vias (no mechanical holes — those are in the board outline).
+pub fn write_excellon(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
+    let mut f = BufWriter::new(File::create(path)?);
+    writeln!(f, "M48")?;
+    writeln!(f, "METRIC")?;
+    let drills: Vec<f64> = {
+        let mut d = Vec::new();
+        for via in &result.via_objects {
+            if !d.iter().any(|v| (v - via.drill_mm).abs() < 1e-6) {
+                d.push(via.drill_mm);
+            }
+        }
+        d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        d
+    };
+    for (i, drill) in drills.iter().enumerate() {
+        writeln!(f, "T{:02}C{:.3}", i + 1, drill)?;
+    }
+    writeln!(f, "%")?;
+    for via in &result.via_objects {
+        let tool = drills.iter().position(|d| (d - via.drill_mm).abs() < 1e-6).unwrap() + 1;
+        writeln!(f, "T{:02}", tool)?;
+        writeln!(f, "X{:06.3}Y{:06.3}", via.x_mm, via.y_mm)?;
+    }
+    writeln!(f, "M30")?;
+    let _ = board;
+    f.flush()?;
+    Ok(())
+}
+
+/// Mirrored 1:1 template for the back copper layer.
+pub fn write_lut_template_back(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
+    let mut mirrored_board = board.clone();
+    for fp in &mut mirrored_board.footprints {
+        fp.x = board.width_mm - fp.x - fp.width_mm;
+        for pad in &mut fp.pads {
+            pad.x = fp.width_mm - pad.x;
+        }
+    }
+    let mirrored = RoutingResult {
+        segments: result
+            .segments
+            .iter()
+            .filter(|s| s.layer == CopperLayer::BCu)
+            .map(|s| RouteSegment {
+                x1_mm: board.width_mm - s.x1_mm,
+                y1_mm: s.y1_mm,
+                x2_mm: board.width_mm - s.x2_mm,
+                y2_mm: s.y2_mm,
+                ..s.clone()
+            })
+            .collect(),
+        ..RoutingResult::new()
+    };
+    write_lut_template(&mirrored_board, &mirrored, path)
+}
+
 pub fn write_lut_template(board: &Board, result: &RoutingResult, path: &str) -> Result<()> {
     let border = 10.0_f64;
     let (doc, page1, layer1) = PdfDocument::new(

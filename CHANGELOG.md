@@ -4,6 +4,109 @@ All notable changes to AmpRoute Studio are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] — 2026-11-23
+
+Major release: agent-first workflow, professional routing geometry and official CAM.
+
+- Agent API v1.0 on CLI/MCP with stable JSON contract and quality schema.
+- 8-connected/octile A*, line-of-sight simplification, 45° canonicalisation,
+  LUT width taper; `non_canonical = 0` on routed boards.
+- Star power/ground pre-route, jumper planning/insertion, single- and two-layer
+  routing with vias.
+- Official KiCad exporters for IPC-2581 Rev C and ODB++; Gerber/SVG/PDF/LUT/Excellon.
+- 15 reference boards at 100 % routing with zero KiCad DRC violations.
+- New KiCad-like egui editor, new README/About and cleaned repository layout.
+
+## [1.3.2] — 2026-11-23
+
+- CAM-форматы теперь создаются официальными экспортёрами KiCad 10: IPC-2581 Rev C
+  (`--ipc`) и ODB++ zip (`--odb`), а не самописными приближениями.
+- Перемычки стали DRC-совместимым представлением: JP footprint добавляется в
+  плату, сеть убирается из netlist (провод изолированный), координаты — в
+  `jumpers.csv`. `kicad-cli DRC` остаётся чистым.
+- Финальный визуальный аудит: `non_canonical=0`, 7/7 цепей, DRC 0.
+
+## [1.3.1] — 2026-11-22
+
+- GUI starts with **no preloaded board**; the five built-in designs remain test
+  fixtures only. File → Choose export folder and the Export panel let the user
+  select the output directory; `Ctrl+K`/`Ctrl+E` honour it.
+- Copper is drawn with round caps/joins in the 2-D viewer so corner pixels look
+  like circular-aperture Gerber. The routed geometry itself is unchanged: an
+  experimental geometric chamfer was validated in isolation but changed the
+  clearance/parallel-run verdicts on shipped boards, so it stays disabled.
+
+## [1.3.0] — 2026-11-22
+
+All five stages of `docs/quality-roadmap.md` implemented; the external SPICE
+path is now verified against a real ngspice 47 run on RC and op-amp golden
+cases (`tests/spice_golden.rs`, enabled with `AMPROUTE_NGSPICE`). Bench
+validation on a physical amplifier remains explicitly blocked — see the
+roadmap.
+
+### Added
+
+- `NetExcitation` (RMS/peak, spectrum, return net, source impedance) with CLI
+  `--currents` and MCP `measure_currents`/`excitations`.
+- Built-in linear AC solver (`src/ac.rs`): complex MNA over R/C/L, sources and
+  op-amp macromodels; gain/phase sweep, −3 dB bandwidth and phase margin.
+  `src/spice.rs` emits a ngspice deck and runs it when the simulator exists.
+- `src/emi.rs`: parallel-run coupling in dB and return-loop areas from the
+  delivered copper; `src/thermal.rs::solve_transient`: junction estimate, time
+  constant and copper-aware conductivity.
+- MCP tools `run_ac`, `generate_netlist`, `run_emi`, `run_thermal`; CLI flags
+  `--ac-models`, `--transient`; `quality` carries `model`, `confidence`,
+  `assumptions` and per-analysis pass flags that gate `ok` when requested.
+
+## [1.2.1] — 2026-11-21
+
+- Ten agent-designed experimental amplifier boards (`src/extra_boards.rs`),
+  reachable via `--board <id>`, `--list-boards` and the MCP tool
+  `list_extra_boards`. All ten route 100 % with zero KiCad 10 DRC violations
+  and produce the complete LUT file set — the reference case for the
+  "agent invents a board → router returns finished files" workflow.
+
+## [1.2.0] — 2026-11-21
+
+Professional-tool pass: deterministic agent interface, a KiCad-like editor and
+real two-layer capability. All five built-in boards now route 100 % with zero
+DRC violations and a complete export set under the default settings.
+
+### Added
+
+- **MCP server** (`amproute-mcp`): JSON-RPC 2.0 over stdio with
+  `get_capabilities`, `list_boards`, `validate_board`, `route_board`,
+  `get_result` and `run_drc`; `--json` CLI now emits exactly one JSON document.
+- **Two-layer routing**: `Board::two_layer`, plated `Via` objects, a layered
+  A* completion pass for nets the single-layer engine cannot finish, B.Cu
+  Gerber, KiCad vias, two-layer DRC and GUI layer/via display.
+- `--two-layer` CLI flag and the GUI checkbox.
+- Acceptance test for all five boards (100 % routing, clean own DRC, four
+  exports) and two-layer export/KiCad tests. All five exported boards were
+  verified with `kicad-cli 10.0.8 pcb drc --severity-all`: zero violations and
+  zero unconnected items. The CLI now auto-detects `kicad-cli` even when it is
+  not on PATH and includes the result in `drc.kicad_drc_ran`.
+
+### Changed
+
+- **New egui GUI** with KiCad-like menus, toolbars, layer/appearance tree,
+  board canvas with rotation and mirroring, selection/inspector and status bar.
+  The Python/pywebview mock is no longer part of the build.
+- Module 5 star rails are now obstacle-aware soft biases; the engine routes
+  every rail itself with exact clearance, which removes the clearance conflicts
+  between fixed rails and signal copper.
+- Finer-grid retry (0.5 → 0.25 mm) when nets remain unroutable.
+- Footprint rotation is applied consistently in the model, importer, exporter
+  and renderer.
+
+### Fixed
+
+- `ok` is derived from routing/DRC/export instead of being hardcoded; DRC runs
+  after the KiCad file is written; measurements get per-class currents; JSON
+  input works through the file pipeline; power and ground no longer share a
+  star; via-free profiles no longer accept via budgets and vice versa.
+- Reference tests now use finite time budgets; Rust 1.75 MSRV restored.
+
 ## [1.1.0] — 2026-11-18
 
 Both `.kicad_pcb` and the program's own JSON are now first-class inputs, the

@@ -9,12 +9,38 @@
 
 use crate::board::{Board, NetClass};
 use crate::occupancy::Occupancy;
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 
+/// Copper layer of a routed segment. Single-layer boards use `FCu`; the
+/// two-layer engine will emit `BCu` where it crosses with a via.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum CopperLayer {
+    FCu,
+    BCu,
+}
+
+impl Default for CopperLayer {
+    fn default() -> Self {
+        Self::FCu
+    }
+}
+
+impl CopperLayer {
+    pub fn kicad_name(self) -> &'static str {
+        match self {
+            CopperLayer::FCu => "F.Cu",
+            CopperLayer::BCu => "B.Cu",
+        }
+    }
+}
+
 /// A routed track segment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RouteSegment {
+    #[serde(default)]
+    pub layer: CopperLayer,
     pub x1_mm: f64,
     pub y1_mm: f64,
     pub x2_mm: f64,
@@ -29,6 +55,7 @@ pub struct RouteSegment {
 impl RouteSegment {
     pub fn new(x1: f64, y1: f64, x2: f64, y2: f64, net: &str, class: NetClass) -> Self {
         Self {
+            layer: CopperLayer::default(),
             x1_mm: x1,
             y1_mm: y1,
             x2_mm: x2,
@@ -45,19 +72,40 @@ impl RouteSegment {
         self
     }
 
+    /// Same segment, assigned to a copper layer.
+    pub fn on_layer(mut self, layer: CopperLayer) -> Self {
+        self.layer = layer;
+        self
+    }
+
     pub fn length_mm(&self) -> f64 {
         ((self.x2_mm - self.x1_mm).powi(2) + (self.y2_mm - self.y1_mm).powi(2)).sqrt()
     }
 }
 
+/// A plated transition between F.Cu and B.Cu.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Via {
+    pub x_mm: f64,
+    pub y_mm: f64,
+    pub net: String,
+    pub class: NetClass,
+    /// Outer diameter and drill, in millimetres.
+    pub diameter_mm: f64,
+    pub drill_mm: f64,
+}
+
 /// Result of a routing run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct RoutingResult {
     pub segments: Vec<RouteSegment>,
     pub routed_nets: Vec<String>,
     pub failed_nets: Vec<String>,
     pub total_length_mm: f64,
+    /// Count, kept in sync with `via_objects` when the two-layer router runs.
     pub vias: usize,
+    #[serde(default)]
+    pub via_objects: Vec<Via>,
 }
 
 impl RoutingResult {
@@ -84,7 +132,21 @@ pub struct Router {
     /// strong enough to prefer free board, weak enough that a zone never
     /// wrecks the routing of a dense single-layer board.
     pub penalty_weight: f32,
+    /// Clearance enforced by the routing rules; may be stricter than the
+    /// board's own preset after clamping to the manufacturable band.
+    pub clearance_mm: f64,
+    /// Optional 8-connected search with octile heuristic. Off by default:
+    /// the engine compares its result with the stable 4-connected one.
+    pub diagonal_search: bool,
     pub bounds: (i32, i32, i32, i32),
+    /// Fixed power/ground copper, as hard obstacles: no other net may cross it.
+    /// Tuples are `(x1, y1, x2, y2, half_width, net_index)`.
+    pub fixed_tracks: Vec<(f64, f64, f64, f64, f64, usize)>,
+    /// Wall-clock ceiling for one `route_in_order` call. Checked between nets
+    /// and between width attempts within a net, so a caller with a deadline
+    /// gets its copper back instead of waiting for a search that will not
+    /// finish. `None` runs to completion.
+    pub deadline: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -188,13 +250,23 @@ impl Router {
             grid_mm,
             penalty_zones: HashSet::new(),
             penalty_weight: 1.5,
+            clearance_mm: 0.3,
+            diagonal_search: false,
+            fixed_tracks: Vec::new(),
             bounds: (
                 0,
                 0,
                 (width_mm / grid_mm).ceil() as i32,
                 (height_mm / grid_mm).ceil() as i32,
             ),
+            deadline: None,
         }
+    }
+
+    /// `true` once the caller's deadline has passed.
+    fn out_of_time(&self) -> bool {
+        self.deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
     }
 
     /// Add a soft zone around a thermal hotspot or the star-ground point.
@@ -442,14 +514,27 @@ impl Router {
     fn route_with_order(&self, board: &Board, order: &[usize]) -> OrderRun {
         let mut result = RoutingResult::new();
         let mut stuck: Vec<StuckNet> = Vec::new();
-        let clearance = board.preset.min_clearance_mm;
+        let clearance = self.clearance_mm;
 
         // Copper must be judged with exact millimetre geometry: stamping
         // clearance into whole grid cells rounds every obstacle up on four
         // sides and leaves no channel at a 2.54 mm pad pitch.
-        let mut occupancy = Occupancy::new(board, &[]);
+        let mut occupancy = Occupancy::new(board, &self.fixed_tracks);
 
         for &index in order {
+            if self.out_of_time() {
+                // Report what was not attempted so the caller sees the truth
+                // rather than a silently short plan.
+                for &rest in &order[order.iter().position(|&i| i == index).unwrap_or(0)..] {
+                    let net = &board.nets[rest];
+                    if board.net_terminals(net).len() > 1
+                        && !result.routed_nets.iter().any(|n| n == &net.name)
+                    {
+                        result.failed_nets.push(format!("{}: deadline reached", net.name));
+                    }
+                }
+                break;
+            }
             let net = &board.nets[index];
             let terminals: Vec<(f64, f64)> = board.net_terminals(net);
             if terminals.len() < 2 {
@@ -488,6 +573,12 @@ impl Router {
             let mut last_target: Option<(i32, i32)> = None;
 
             for width in widths {
+                // A width attempt is the expensive unit here: check the clock
+                // before starting another one.
+                if self.out_of_time() {
+                    failure = Some("deadline reached".into());
+                    break;
+                }
                 // Half the track's own width: the centre line plus half a track
                 // must clear every obstruction, and the copper edge must clear
                 // the board outline by the process edge clearance.
@@ -548,12 +639,13 @@ impl Router {
                             for cell in &path {
                                 connected.insert(*cell);
                             }
-                            attempt_segs.extend(self.path_to_segments(
-                                &path,
-                                &net.name,
-                                net.class,
-                                width,
-                            ));
+                            let path_segs =
+                                self.path_to_segments(&path, &net.name, net.class, width);
+                            // Geometry stays as the validator approved it.
+                            // Corner rounding is visual only (GUI round caps):
+                            // a geometric chamfer changed the parallel-run and
+                            // clearance verdicts on the shipped boards.
+                            attempt_segs.extend(path_segs);
                             pending.retain(|p| !connected.contains(p));
                         }
                     }
@@ -611,7 +703,11 @@ impl Router {
         OrderRun { result, stuck }
     }
 
-    /// Collapse a grid path into maximal straight segments.
+    /// Collapse a grid path into maximal straight 0°/45°/90° segments.
+    ///
+    /// A 4-neighbour A* path is a staircase; joining the ends of a staircase
+    /// diagonal into one 45° line is legal only if the whole new segment clears
+    /// every pad, hole and routed copper shape at exact millimetre geometry.
     fn path_to_segments(
         &self,
         path: &[(i32, i32)],
@@ -623,31 +719,119 @@ impl Router {
         if path.len() < 2 {
             return segs;
         }
+        let point = |c: (i32, i32)| (c.0 as f64 * self.grid_mm, c.1 as f64 * self.grid_mm);
+        // Search geometry stays byte-stable: merge only exact collinear runs.
+        // Line-of-sight simplification is applied after routing in
+        // `routing_engine::simplify_result`, where it can be validated and
+        // rolled back without changing which nets get routed.
         let mut i = 0;
         while i < path.len() - 1 {
-            let (x1, y1) = path[i];
-            let dir = (path[i + 1].0 - x1, path[i + 1].1 - y1);
+            let dir = (path[i + 1].0 - path[i].0, path[i + 1].1 - path[i].1);
             let mut j = i;
             while j + 1 < path.len()
                 && (path[j + 1].0 - path[j].0, path[j + 1].1 - path[j].1) == dir
             {
                 j += 1;
             }
-            let (x2, y2) = path[j];
-            segs.push(
-                RouteSegment::new(
-                    x1 as f64 * self.grid_mm,
-                    y1 as f64 * self.grid_mm,
-                    x2 as f64 * self.grid_mm,
-                    y2 as f64 * self.grid_mm,
-                    net,
-                    class,
-                )
-                .with_width(width_mm),
-            );
+            let a = point(path[i]);
+            let b = point(path[j]);
+            segs.push(RouteSegment::new(a.0, a.1, b.0, b.1, net, class).with_width(width_mm));
             i = j;
         }
         segs
+    }
+
+    /// Chamfer each legal corner of a routed net.
+    ///
+    /// Toner-transfer copper should not ship with needle-sharp corners: a
+    /// small 45° cut at a 90° turn prints and etches more reliably. Every cut
+    /// is checked against the exact-millimetre occupancy field, so a chamfer
+    /// is applied only where the new diagonal copper clears other nets.
+    pub(crate) fn chamfer_corners(
+        &self,
+        segments: &[RouteSegment],
+        half: f64,
+        clearance: f64,
+        net: usize,
+        occupancy: &Occupancy,
+    ) -> Vec<RouteSegment> {
+        if segments.len() < 2 {
+            return segments.to_vec();
+        }
+        let clone_between = |seg: &RouteSegment, from: (f64, f64), to: (f64, f64)| RouteSegment {
+            layer: seg.layer,
+            x1_mm: from.0,
+            y1_mm: from.1,
+            x2_mm: to.0,
+            y2_mm: to.1,
+            net: seg.net.clone(),
+            class: seg.class,
+            width_mm: seg.width_mm,
+        };
+        let mut out = Vec::new();
+        let mut start = (segments[0].x1_mm, segments[0].y1_mm);
+        for pair in segments.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            let p = (a.x2_mm, a.y2_mm);
+            let a_start = (a.x1_mm, a.y1_mm);
+            let b_end = (b.x2_mm, b.y2_mm);
+            let len_a = ((a_start.0 - p.0).powi(2) + (a_start.1 - p.1).powi(2)).sqrt();
+            let len_b = ((b_end.0 - p.0).powi(2) + (b_end.1 - p.1).powi(2)).sqrt();
+            let cross = (p.0 - a_start.0) * (b_end.1 - p.1) - (p.1 - a_start.1) * (b_end.0 - p.0);
+            let dot = (p.0 - a_start.0) * (b_end.0 - p.0) + (p.1 - a_start.1) * (b_end.1 - p.1);
+            // Only a true 90° corner between two axis-aligned runs gets a
+            // chamfer. A 45° turn would produce a 22.5° bridge, which is not
+            // a canonical LUT angle.
+            let axis_aligned = |s: &RouteSegment| {
+                (s.x2_mm - s.x1_mm).abs() < 1e-6 || (s.y2_mm - s.y1_mm).abs() < 1e-6
+            };
+            if !axis_aligned(a)
+                || !axis_aligned(b)
+                || cross.abs() < 1e-9
+                || dot < 0.0
+                || len_a < 1e-6
+                || len_b < 1e-6
+            {
+                out.push(clone_between(a, start, p));
+                start = p;
+                continue;
+            }
+            // Largest legal cut wins: a visible 45° chamfer where there is
+            // room, a smaller one in tight channels, no cut at all if even
+            // 0.25 mm would violate clearance.
+            let mut chosen: Option<(f64, (f64, f64), (f64, f64))> = None;
+            for wanted in [1.0_f64, 0.75, 0.5, 0.25] {
+                let cut = wanted.min(len_a * 0.3).min(len_b * 0.3);
+                if cut < 0.2 {
+                    continue;
+                }
+                let p1 = (
+                    p.0 + (a_start.0 - p.0) / len_a * cut,
+                    p.1 + (a_start.1 - p.1) / len_a * cut,
+                );
+                let p2 = (
+                    p.0 + (b_end.0 - p.0) / len_b * cut,
+                    p.1 + (b_end.1 - p.1) / len_b * cut,
+                );
+                // Exact millimetre geometry along the whole diagonal, with a
+                // small process margin: endpoint samples are not enough.
+                if occupancy.allows_segment(p1, p2, half, clearance + 0.1, net) {
+                    chosen = Some((cut, p1, p2));
+                    break;
+                }
+            }
+            let Some((_cut, p1, p2)) = chosen else {
+                out.push(clone_between(a, start, p));
+                start = p;
+                continue;
+            };
+            out.push(clone_between(a, start, p1));
+            out.push(clone_between(a, p1, p2));
+            start = p2;
+        }
+        let last = segments.last().unwrap();
+        out.push(clone_between(last, start, (last.x2_mm, last.y2_mm)));
+        out
     }
 
     /// Which cells `net_index` may occupy at `half` width, and what entering
@@ -722,10 +906,11 @@ impl Router {
         }
 
         let cells = grid.step.len();
+        let sqrt2 = std::f64::consts::SQRT_2 as f32;
 
-        // Exact distance to the nearest goal on an otherwise empty board, by BFS
-        // from all goals at once. Scanning the grid here is what lets the search
-        // itself run on plain arrays instead of hash maps.
+        // Exact Manhattan distance to the nearest goal on an empty board, by
+        // BFS from all goals at once. Kept deliberately 4-connected: changing
+        // the search graph changes every routing decision on dense LUT boards.
         let mut guess = vec![f32::INFINITY; cells];
         let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
         for g in goals {
@@ -742,12 +927,7 @@ impl Router {
         while let Some(i) = queue.pop_front() {
             let d = guess[i] + 1.0;
             let c = grid.point(i);
-            for nb in [
-                (c.0 + 1, c.1),
-                (c.0 - 1, c.1),
-                (c.0, c.1 + 1),
-                (c.0, c.1 - 1),
-            ] {
+            for nb in [(c.0 + 1, c.1), (c.0 - 1, c.1), (c.0, c.1 + 1), (c.0, c.1 - 1)] {
                 if !grid.inside(nb) {
                     continue;
                 }
@@ -762,6 +942,21 @@ impl Router {
         for value in guess.iter_mut() {
             if !value.is_finite() {
                 *value = unreachable;
+            }
+        }
+        if self.diagonal_search {
+            // Octile distance is admissible for 8-connected movement.
+            let goals_xy: Vec<(i32, i32)> = goals.iter().copied().collect();
+            for i in 0..cells {
+                let c = grid.point(i);
+                guess[i] = goals_xy
+                    .iter()
+                    .map(|g| {
+                        let dx = (c.0 - g.0).abs() as f32;
+                        let dy = (c.1 - g.1).abs() as f32;
+                        dx.max(dy) + (sqrt2 - 1.0) * dx.min(dy)
+                    })
+                    .fold(f32::INFINITY, f32::min);
             }
         }
 
@@ -784,7 +979,16 @@ impl Router {
             cell: start_cell,
         });
 
+        // Expanding a cell is the innermost expensive step, so the clock is
+        // consulted here too: one net on a dense board can otherwise outlast
+        // the caller's whole budget.
+        let mut expanded = 0usize;
+
         while let Some(node) = open.pop() {
+            expanded += 1;
+            if expanded % 2048 == 0 && self.out_of_time() {
+                return None;
+            }
             // Stale heap entry: a shorter route to this cell was already found.
             if node.g > distance[node.cell] {
                 continue;
@@ -808,12 +1012,28 @@ impl Router {
             }
 
             let c = grid.point(node.cell);
-            for nb in [
-                (c.0 + 1, c.1),
-                (c.0 - 1, c.1),
-                (c.0, c.1 + 1),
-                (c.0, c.1 - 1),
-            ] {
+            let mut candidates = vec![
+                (c.0 + 1, c.1, 1.0_f32),
+                (c.0 - 1, c.1, 1.0),
+                (c.0, c.1 + 1, 1.0),
+                (c.0, c.1 - 1, 1.0),
+            ];
+            if self.diagonal_search {
+                let passable = |p: (i32, i32)| {
+                    grid.inside(p) && {
+                        let pi = grid.flat(p);
+                        is_goal[pi] || grid.step[pi].is_finite()
+                    }
+                };
+                for (dx, dy) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                    // Do not cut the corner between two blocked neighbours.
+                    if passable((c.0 + dx, c.1)) || passable((c.0, c.1 + dy)) {
+                        candidates.push((c.0 + dx, c.1 + dy, sqrt2));
+                    }
+                }
+            }
+            for (nx, ny, factor) in candidates {
+                let nb = (nx, ny);
                 if !grid.inside(nb) {
                     continue;
                 }
@@ -821,7 +1041,7 @@ impl Router {
                 // A terminal of this net is always reachable, even if another
                 // net's pad sits within clearance of it: refusing it would make a
                 // routable net fail for no real reason.
-                let step = if is_goal[ni] { 1.0 } else { grid.step[ni] };
+                let step = if is_goal[ni] { 1.0 } else { grid.step[ni] } * factor;
                 if !step.is_finite() {
                     continue;
                 }
@@ -890,6 +1110,24 @@ mod tests {
             "length {}",
             r.total_length_mm
         );
+    }
+
+    #[test]
+    fn corners_are_chamfered_for_lut() {
+        let board = Board::new("chamfer", 40.0, 30.0, LutPreset::reliable());
+        let router = Router::new(0.5, board.width_mm, board.height_mm);
+        let occupancy = Occupancy::new(&board, &[]);
+        let raw = vec![
+            RouteSegment::new(5.0, 10.0, 20.0, 10.0, "N", NetClass::Signal),
+            RouteSegment::new(20.0, 10.0, 20.0, 25.0, "N", NetClass::Signal),
+        ];
+        let cut = router.chamfer_corners(&raw, 0.2, 0.3, 0, &occupancy);
+        assert_eq!(cut.len(), 3, "expected two trimmed legs plus a chamfer: {cut:?}");
+        let mid = &cut[1];
+        let dx = (mid.x2_mm - mid.x1_mm).abs();
+        let dy = (mid.y2_mm - mid.y1_mm).abs();
+        assert!((dx - dy).abs() < 1e-9, "chamfer must be 45°: {mid:?}");
+        assert!(dx >= 0.4, "chamfer is too small to print: {mid:?}");
     }
 
     #[test]

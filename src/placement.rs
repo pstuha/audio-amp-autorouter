@@ -3,6 +3,10 @@
 //! Places components along the signal chain: input (left) → gain stages (center) → output (right).
 //! Power rail runs along the top edge, ground star-point along the bottom.
 //! Enforces input/output/power isolation per ТЗ 5.2.
+//!
+//! Placement carries rotation: power, output and ground footprints are placed
+//! rotated 180°, facing the edge they run along ([`Footprint::with_rotation`]),
+//! and the placed board can be exported with [`PlacementResult::write_kicad_pcb`].
 
 use crate::board::{Board, Footprint, LutPreset, Net, NetClass, Pad, PadRef};
 
@@ -12,13 +16,42 @@ pub struct PlacementResult {
 }
 
 impl PlacementResult {
+    /// Opt-in placement optimization for a user board. Tries a 180° flip of
+    /// each THT footprint and keeps it only when the validation issue count
+    /// improves. Never called implicitly by the pipeline.
+    pub fn optimize(board: &Board) -> Board {
+        let mut best = board.clone();
+        let mut best_issues = best.validate().len();
+        for index in 0..best.footprints.len() {
+            let mut candidate = best.clone();
+            let fp = &mut candidate.footprints[index];
+            fp.rotation_deg = if fp.rotation_deg.abs() < 1e-9 {
+                180.0
+            } else {
+                0.0
+            };
+            for pad in &mut fp.pads {
+                pad.x = fp.width_mm - pad.x;
+                pad.y = fp.height_mm - pad.y;
+            }
+            let issues = candidate.validate().len();
+            if issues < best_issues {
+                best = candidate;
+                best_issues = issues;
+            }
+        }
+        best
+    }
+
     /// Create a complete amplifier board with auto-placed components.
     ///
     /// Signal flow: **JIN** (left) → **C_IN** → **Q1/Q2** (LTP) → **Q3/Q4** (VAS) →
     /// **Q5/Q6** (output) → **JOUT** (right).
     ///
-    /// Power: VCC rail and decoupling caps along the top edge.
-    /// Ground: star point centred at the bottom edge (ТЗ 5.1).
+    /// Power: VCC rail and decoupling caps along the top edge; the output
+    /// stage sits in the last strip of the board. Ground: star point on the
+    /// bottom edge (ТЗ 5.1). Power, output and ground footprints are placed
+    /// rotated 180°, facing the edge.
     pub fn auto_amplifier() -> Self {
         let (bw, bh) = (200.0f64, 150.0f64);
         let mut board = Board::new("AmpRoute Studio Demo", bw, bh, LutPreset::reliable());
@@ -158,7 +191,7 @@ impl PlacementResult {
             "Q5",
             "IRF540",
             NetClass::Output,
-            120.0,
+            175.0,
             bh * 0.55,
             10.0,
             8.0,
@@ -172,7 +205,7 @@ impl PlacementResult {
             "Q6",
             "IRF9540",
             NetClass::Output,
-            120.0,
+            175.0,
             bh * 0.72,
             10.0,
             8.0,
@@ -186,7 +219,7 @@ impl PlacementResult {
             "JOUT",
             "RCA-OUT",
             NetClass::Output,
-            155.0,
+            174.0,
             bh * 0.62,
             12.0,
             10.0,
@@ -199,7 +232,7 @@ impl PlacementResult {
             "+V",
             NetClass::Power,
             bw * 0.5,
-            10.0,
+            bh - 10.0,
             12.0,
             8.0,
             vec![Pad::new(4.0, 4.0, 2.0, 1.0), Pad::new(8.0, 4.0, 2.0, 1.0)],
@@ -209,7 +242,7 @@ impl PlacementResult {
             "100uF",
             NetClass::Bias,
             40.0,
-            10.0,
+            bh - 10.0,
             8.0,
             7.0,
             vec![Pad::new(2.5, 3.5, 1.6, 0.9), Pad::new(5.5, 3.5, 1.6, 0.9)],
@@ -219,7 +252,7 @@ impl PlacementResult {
             "100uF",
             NetClass::Bias,
             bw - 48.0,
-            10.0,
+            bh - 10.0,
             8.0,
             7.0,
             vec![Pad::new(2.5, 3.5, 1.6, 0.9), Pad::new(5.5, 3.5, 1.6, 0.9)],
@@ -231,11 +264,28 @@ impl PlacementResult {
             "GND-STAR",
             NetClass::Ground,
             bw * 0.5 - 6.0,
-            bh - 20.0,
+            12.0,
             12.0,
             8.0,
             vec![Pad::new(4.0, 4.0, 2.0, 1.0), Pad::new(8.0, 4.0, 2.0, 1.0)],
         );
+
+        // Placement with rotation: power, output, bias and ground parts carry
+        // a 180° rotation so they face the edge they run along.
+        for fp in board.footprints.iter_mut() {
+            if matches!(
+                fp.class,
+                NetClass::Power | NetClass::Output | NetClass::Ground | NetClass::Bias
+            ) {
+                fp.rotation_deg = 180.0;
+                // The pads were authored at their final world positions. Mirror
+                // the local offsets so rotating the footprint keeps them there.
+                for pad in &mut fp.pads {
+                    pad.x = fp.width_mm - pad.x;
+                    pad.y = fp.height_mm - pad.y;
+                }
+            }
+        }
 
         // === Define nets (signal chain) ===
         let mut add_net = |name: &str, class: NetClass, nodes: Vec<(&str, usize)>| {
@@ -295,6 +345,15 @@ impl PlacementResult {
             ],
         );
         Self { board }
+    }
+
+    /// Write the placed board to `path` as a `.kicad_pcb` file — footprints
+    /// with their placed (rotated) positions and nets defined; no routed
+    /// copper yet (the routing stage adds that later).
+    pub fn write_kicad_pcb(&self, path: &str) -> anyhow::Result<()> {
+        let empty = crate::router::RoutingResult::new();
+        let fab = crate::kicad::FabOptions::default();
+        crate::kicad::write_kicad_pcb(&self.board, &empty, &fab, path)
     }
 
     /// Component placement checks: overlapping or too-close footprints.
@@ -444,5 +503,61 @@ mod tests {
             dx
         );
         assert!(dy.abs() < 20.0, "Should be roughly on same horizontal line");
+    }
+
+    #[test]
+    fn power_and_thermal_parts_are_at_board_edges() {
+        let pr = PlacementResult::auto_amplifier();
+        let b = &pr.board;
+        let power: Vec<&Footprint> = b
+            .footprints
+            .iter()
+            .filter(|f| matches!(f.class, NetClass::Power | NetClass::Ground))
+            .collect();
+        assert!(!power.is_empty());
+        for f in &power {
+            let (x0, y0, x1, y1) = f.rect();
+            let dist = [x0, y0, b.width_mm - x1, b.height_mm - y1]
+                .into_iter()
+                .fold(f64::MAX, f64::min);
+            assert!(dist <= 15.0, "{} not at the board edge: {dist} mm", f.refdes);
+        }
+        // Thermal hotspots: the output stage sits in the last strip of the board.
+        assert!(b.thermal_hotspots().len() >= 3);
+        for (x, y, _r) in b.thermal_hotspots() {
+            let dist = [x, y, b.width_mm - x, b.height_mm - y]
+                .into_iter()
+                .fold(f64::MAX, f64::min);
+            assert!(
+                dist <= 30.0,
+                "hotspot ({x:.1},{y:.1}) too far from an edge: {dist:.1} mm"
+            );
+        }
+    }
+
+    #[test]
+    fn power_parts_carry_rotation() {
+        let pr = PlacementResult::auto_amplifier();
+        for refdes in ["VCC", "C_P1", "C_P2", "GND"] {
+            let f = pr.board.footprint(refdes).expect("footprint exists");
+            assert!(
+                f.rotation_deg.abs() > 1.0,
+                "{refdes} should be placed rotated"
+            );
+        }
+    }
+
+    #[test]
+    fn write_kicad_pcb_writes_placed_footprints() {
+        let pr = PlacementResult::auto_amplifier();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placed.kicad_pcb");
+        let path = path.to_string_lossy().to_string();
+        pr.write_kicad_pcb(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("(kicad_pcb"));
+        for fp in &pr.board.footprints {
+            assert!(text.contains(&fp.refdes), "missing refdes {}", fp.refdes);
+        }
     }
 }

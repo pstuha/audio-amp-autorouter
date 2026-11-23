@@ -183,6 +183,32 @@ impl Occupancy {
         }
     }
 
+    /// May a straight centre-line segment be laid for `net` at `half` width?
+    ///
+    /// Every 0.1 mm along the segment is tested with the same exact-mm
+    /// clearance as `allows`. Used by the line-of-sight path simplifier and by
+    /// corner chamfers, where a few endpoint samples are not enough.
+    pub fn allows_segment(
+        &self,
+        a: (f64, f64),
+        b: (f64, f64),
+        half: f64,
+        clearance: f64,
+        net: usize,
+    ) -> bool {
+        let length = (b.0 - a.0).hypot(b.1 - a.1);
+        let steps = (length / 0.2).ceil().max(1.0) as usize;
+        (0..=steps).all(|i| {
+            let t = i as f64 / steps as f64;
+            self.allows(
+                (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t),
+                half,
+                clearance,
+                net,
+            )
+        })
+    }
+
     /// May a track of net `net`, `half` millimetres wide on each side of its
     /// centre line, pass through `p`?
     ///

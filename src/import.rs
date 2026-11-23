@@ -135,19 +135,19 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
     for fp_node in root.children("footprint").chain(root.children("module")) {
         let lib_id = fp_node.atom(1).unwrap_or("unknown").to_string();
 
-        // Position: `(at X Y [rot])`. Rotation is ignored: we keep the pads'
-        // relative offsets, which is what matters for routing.
+        // Position: `(at X Y [rot])`. KiCad's positive angle is
+        // counter-clockwise on screen while its Y axis points down.
         let at = match fp_node.child("at") {
             Some(a) => a,
             None => continue,
         };
         let fx = at.number(1).unwrap_or(0.0);
         let fy = at.number(2).unwrap_or(0.0);
-        if at.number(3).map(|r| r.abs() > 1e-9).unwrap_or(false) {
-            warnings.push(format!(
-                "{lib_id}: rotation is not modelled; pads are routed at 0 degrees"
-            ));
-        }
+        let angle = at.number(3).unwrap_or(0.0);
+        let rotate = |x: f64, y: f64| {
+            let r = angle.to_radians();
+            (x * r.cos() + y * r.sin(), -x * r.sin() + y * r.cos())
+        };
 
         // A non-plated mounting hole is a board feature, not a component. Both
         // `MountingHole:MountingHole_3.2mm` (KiCad library) and the bare
@@ -214,7 +214,8 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
 
             let index = pads.len();
             pads.push(Pad::new(px, py, size, drill));
-            pads_world.push((fx + px, fy + py, size, drill, refdes.clone()));
+            let (wx, wy) = rotate(px, py);
+            pads_world.push((fx + wx, fy + wy, size, drill, refdes.clone()));
 
             if let Some(net_name) = &net {
                 net_nodes
@@ -241,6 +242,13 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
         let margin = 1.2;
         let width = (max_x - min_x) + 2.0 * margin;
         let height = (max_y - min_y) + 2.0 * margin;
+        // The model measures pad offsets from the footprint's bounding-box
+        // top-left; KiCad measures them from the footprint anchor.
+        let (origin_x, origin_y) = (min_x - margin, min_y - margin);
+        for pad in &mut pads {
+            pad.x -= origin_x;
+            pad.y -= origin_y;
+        }
 
         let class = net_guess
             .values()
@@ -248,15 +256,19 @@ pub fn import_kicad_pcb_str_named(text: &str, name: &str) -> anyhow::Result<Impo
             .copied()
             .unwrap_or(NetClass::Signal);
 
+        // Rotating the pad-bounding-box centre around KiCad's anchor gives the
+        // model footprint centre; local offsets are measured from the top-left.
+        let (bcx, bcy) = rotate((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
         footprints.push(Footprint {
             refdes: refdes.clone(),
             value,
             class,
-            x: fx + min_x - margin,
-            y: fy + min_y - margin,
+            x: fx + bcx - width / 2.0,
+            y: fy + bcy - height / 2.0,
             width_mm: width,
             height_mm: height,
             pads,
+            rotation_deg: angle,
         });
         report.pads += footprints.last().map(|f| f.pads.len()).unwrap_or(0);
     }
@@ -519,6 +531,28 @@ mod tests {
         assert!(imported.report.outline_from_edges);
         assert!((imported.board.width_mm - 60.0).abs() < 1e-6);
         assert!((imported.board.height_mm - 40.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn imports_rotated_footprints_with_pads_in_the_right_place() {
+        let text = SAMPLE.replace("(at 10 20)", "(at 10 20 90)");
+        let imported = import_kicad_pcb_str(&text).unwrap();
+        let fp = imported
+            .board
+            .footprints
+            .iter()
+            .find(|f| f.refdes == "R1")
+            .unwrap();
+        assert_eq!(fp.rotation_deg, 90.0);
+        // Local pad 2 at (7.5, 0) becomes (10, 12.5) after +90° KiCad rotation.
+        let (x, y) = fp.pad_world(1).unwrap();
+        assert!((x - 10.0).abs() < 1e-6, "x = {x}");
+        assert!((y - 12.5).abs() < 1e-6, "y = {y}");
+        assert!(imported
+            .report
+            .warnings
+            .iter()
+            .all(|w| !w.contains("rotation is not modelled")));
     }
 
     #[test]

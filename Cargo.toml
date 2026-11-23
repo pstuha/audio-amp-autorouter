@@ -1,15 +1,15 @@
 [package]
 name = "amproute-studio"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Autorouter and 2D board viewer for single-layer THT audio amplifier PCBs made with the LUT (toner-transfer) method"
+description = "Agent-first autorouter and 2D board editor for LUT audio amplifier PCBs: KiCad DRC, Gerber/IPC-2581/ODB++, MCP"
 authors = ["Pavel Stuha <pstuha@users.noreply.github.com>"]
 license = "MIT"
 repository = "https://github.com/pstuha/audio-amp-autorouter"
 homepage = "https://github.com/pstuha/audio-amp-autorouter"
 documentation = "https://github.com/pstuha/audio-amp-autorouter/blob/main/README.md"
-keywords = ["pcb", "autorouter", "audio", "amplifier", "lut"]
+keywords = ["pcb", "autorouter", "audio", "amplifier", "lut", "mcp", "kicad"]
 categories = ["command-line-utilities", "graphics"]
 readme = "README.md"
 

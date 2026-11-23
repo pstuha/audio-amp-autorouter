@@ -21,7 +21,9 @@
 
 use anyhow::Result;
 use clap::Parser;
+use serde_json;
 use std::path::PathBuf;
+use amproute_studio::pipeline::{PipelineConfig, run_pipeline};
 
 /// Re-attach to the console that launched this process.
 ///
@@ -76,6 +78,42 @@ struct Args {
     /// reproduces the tested routing results in about a second per small board.
     #[arg(short, long, default_value_t = 0.5)]
     grid: f64,
+
+    /// Route as a two-layer board with plated vias (default: single-layer LUT).
+    #[arg(long)]
+    two_layer: bool,
+
+    /// Agent-supplied net excitations (JSON array) for real electrical quality.
+    #[arg(long)]
+    currents: Option<PathBuf>,
+
+    /// AC component models keyed by reference (JSON object).
+    #[arg(long)]
+    ac_models: Option<PathBuf>,
+
+    /// Add the transient junction-temperature proxy to the report.
+    #[arg(long)]
+    transient: bool,
+
+    /// Compare a 45°/octile routing pass with the stable Manhattan pass.
+    #[arg(long)]
+    diagonal: bool,
+
+    /// Also write an ODB++-style topology profile.
+    #[arg(long)]
+    odb: bool,
+
+    /// Also write an IPC-2581-style XML profile.
+    #[arg(long)]
+    ipc: bool,
+
+    /// Opt-in: try 180° placement flips before routing.
+    #[arg(long)]
+    optimize_placement: bool,
+
+    /// Emit the full pipeline result as JSON to stdout (for GUI integration).
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> Result<()> {
@@ -97,6 +135,10 @@ fn main() -> Result<()> {
 fn print_boards() {
     println!("AmpRoute Studio {} — built-in boards", amproute_studio::VERSION);
     for spec in amproute_studio::BOARD_SPECS {
+        println!("  {:<18} {}", spec.id, spec.summary);
+    }
+    println!("Agent-generated experimental boards:");
+    for spec in amproute_studio::EXTRA_BOARD_SPECS {
         println!("  {:<18} {}", spec.id, spec.summary);
     }
 }
@@ -128,21 +170,31 @@ fn load_board(path: &PathBuf) -> Result<amproute_studio::Board> {
 }
 
 fn run_cli(args: &Args) -> Result<()> {
-    println!("AmpRoute Studio {} — headless", amproute_studio::VERSION);
+    if !args.json {
+        println!("AmpRoute Studio {} — headless", amproute_studio::VERSION);
+    }
 
     if args.input.is_some() && args.board.is_some() {
         eprintln!("Use either --input or --board, not both.");
         std::process::exit(2);
     }
 
-    let board = match (&args.input, &args.board) {
-        (Some(path), _) => load_board(path)?,
-        (None, Some(id)) => amproute_studio::build_board(id).ok_or_else(|| {
+    let mut board = if let Some(path) = &args.input {
+        load_board(path)?
+    } else if let Some(id) = &args.board {
+        amproute_studio::build_any(id).ok_or_else(|| {
             anyhow::anyhow!("unknown board id `{id}` — try --list-boards")
-        })?,
-        (None, None) => amproute_studio::default_board(),
+        })?
+    } else {
+        amproute_studio::default_board()
     };
-
+    if args.two_layer {
+        board.two_layer = true;
+    }
+    if args.optimize_placement {
+        board = amproute_studio::PlacementResult::optimize(&board);
+    }
+    // Validate board before running pipeline.
     let issues = board.validate();
     if !issues.is_empty() {
         eprintln!("Board validation failed:");
@@ -151,85 +203,129 @@ fn run_cli(args: &Args) -> Result<()> {
         }
         std::process::exit(2);
     }
-
-    let grid = args.grid;
-    let mut router = amproute_studio::Router::new(grid, board.width_mm, board.height_mm);
-    for (x, y, radius) in board.thermal_hotspots() {
-        router.add_penalty_circle(x, y, radius);
-    }
-    if let Some((x, y)) = board.star_ground_point() {
-        router.add_penalty_circle(x, y, 8.0);
-    }
-
-    let started = std::time::Instant::now();
-    let result = router.route_board(&board);
-    let elapsed = started.elapsed();
-
-    println!(
-        "Board {} — {:.0}x{:.0} mm, {} footprints, {} nets, {} mounting holes, grid {:.2} mm",
-        board.name,
-        board.width_mm,
-        board.height_mm,
-        board.footprints.len(),
-        board.nets.len(),
-        board.mounting_holes.len(),
-        grid
-    );
-    println!(
-        "Routed {}/{} nets, {:.1} mm of copper, {:.1} s",
-        result.routed_nets.len(),
-        result.total_nets(),
-        result.total_length_mm,
-        elapsed.as_secs_f64()
-    );
-
-    // Thermal report, from the same model the GUI shades.
-    let sources = amproute_studio::thermal::sources_for(&board);
-    let field = amproute_studio::thermal::solve(
-        &board,
-        &sources,
-        &amproute_studio::ThermalParams::default(),
-    );
-    println!(
-        "Thermal: peak rise {:.1} °C at ({:.1}, {:.1}) mm, mean {:.2} °C, {} heat sources",
-        field.peak_rise_c,
-        field.peak_at.0,
-        field.peak_at.1,
-        field.mean_rise_c(),
-        sources.len()
-    );
-
-    if !result.failed_nets.is_empty() {
-        eprintln!("Routing incomplete:");
-        for failure in &result.failed_nets {
-            eprintln!("  - {failure}");
-        }
-        eprintln!("Nothing was exported: incomplete copper is not safe to manufacture.");
-        std::process::exit(3);
-    }
-
-    let dir = args.output.to_string_lossy().to_string();
-    let files = match amproute_studio::export::write_all(&board, &result, &dir) {
-        Ok(files) => files,
-        Err(e) => {
-            eprintln!("Export refused: {e}");
-            std::process::exit(3);
-        }
+    // Build pipeline config
+    let mut config = PipelineConfig {
+        grid_mm: args.grid,
+        time_budget_s: 300.0,
+        run_kicad_cli_drc: true,
+        include_transient: args.transient,
+        diagonal_search: true,
+        ..Default::default()
     };
-    for file in &files {
-        println!("  wrote {file}");
+    if let Some(path) = &args.ac_models {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        let models: std::collections::HashMap<String, amproute_studio::AcModel> =
+            serde_json::from_str(&text)?;
+        config.ac = Some(amproute_studio::AcConfig {
+            models,
+            ..Default::default()
+        });
+    }
+    if let Some(path) = &args.currents {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
+        if let Ok(excitations) = serde_json::from_str::<Vec<amproute_studio::NetExcitation>>(&text) {
+            config.excitations = Some(excitations);
+        } else {
+            config.measure_currents =
+                Some(serde_json::from_str::<Vec<amproute_studio::NetCurrent>>(&text)?);
+        }
+    }
+    let grid = config.grid_mm; // keep for printing
+    // The board was loaded once above (JSON or KiCad); do not reload it here.
+    let res = run_pipeline(board.clone(), config, &args.output.to_string_lossy())?;
+    // Official CAM formats come from KiCad's own exporters, not from a
+    // hand-written approximation: IPC-2581 Rev C and ODB++ (zip).
+    if args.odb || args.ipc {
+        let cli = amproute_studio::drc::find_kicad_cli();
+        let pcb = res
+            .kicad_board_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("KiCad board was not written"))?;
+        if args.ipc {
+            let out = args.output.join("board.xml");
+            let status = std::process::Command::new(&cli)
+                .args(["pcb", "export", "ipc2581", "--version", "C"])
+                .arg("-o")
+                .arg(&out)
+                .arg(pcb)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("kicad-cli IPC-2581 export failed");
+            }
+        }
+        if args.odb {
+            let out = args.output.join("board_odb.zip");
+            let status = std::process::Command::new(&cli)
+                .args(["pcb", "export", "odb", "--compression", "zip"])
+                .arg("-o")
+                .arg(&out)
+                .arg(pcb)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("kicad-cli ODB++ export failed");
+            }
+        }
     }
 
-    // The KiCad board is the deliverable a user actually opens and checks.
-    let stem = board.name.replace(' ', "_").to_lowercase();
-    let kicad_path = format!("{dir}/{stem}.kicad_pcb");
-    let fab = amproute_studio::kicad::FabOptions::default();
-    match amproute_studio::kicad::write_kicad_pcb(&board, &result, &fab, &kicad_path) {
-        Ok(()) => println!("  wrote {kicad_path}"),
-        Err(e) => {
-            eprintln!("KiCad export refused: {e}");
-            std::process::exit(3);
+    // `--json` is the machine-readable contract for agents and the GUI:
+    // stdout carries exactly one JSON document, all human text goes to stderr.
+    if args.json {
+        println!("{}", serde_json::to_string(&res)?);
+    } else {
+        println!(
+            "Board {} — {:.0}x{:.0} mm, {} footprints, {} nets, {} mounting holes, grid {:.2} mm",
+            res.board_name,
+            res.width_mm,
+            res.height_mm,
+            res.footprints,
+            res.nets,
+            res.mounting_holes,
+            grid
+        );
+        println!(
+            "Routed {}/{} nets, {:.1} mm of copper, {:.1} s, deadline_reached={}",
+            res.routing.result.routed_nets.len(),
+            res.nets,
+            res.routing.result.total_length_mm,
+            res.elapsed_ms as f64 / 1000.0,
+            res.routing.deadline_reached
+        );
+        if let Some(j) = &res.jumpers {
+            println!("Jumpers: {}", j.summary());
         }
+        let field = &res.thermal;
+        println!(
+            "Thermal: peak rise {:.1} °C at ({:.1}, {:.1}) mm, mean {:.2} °C, {} heat sources",
+            field.peak_rise_c,
+            field.peak_at.0,
+            field.peak_at.1,
+            field.mean_rise_c(),
+            field.sources.len()
+        );
+        println!(
+            "DRC: {} violation(s) — {}",
+            res.drc.violations.len(),
+            if res.drc.is_ok() { "PASS" } else { "FAIL" }
+        );
+        println!("Export: {} file(s) written", res.exported_files.len());
+        if let Some(path) = &res.kicad_board_path {
+            println!("  wrote {path}");
+        }
+    }
+
+    if !res.ok {
+        eprintln!(
+            "Pipeline incomplete: {} routed nets, {} failed, {} DRC violations",
+            res.routing.result.routed_nets.len(),
+            res.routing.result.failed_nets.len(),
+            res.drc.violations.len()
+        );
+        for v in &res.drc.violations {
+            eprintln!("  DRC: {} — {}", v.rule, v.message);
+        }
+        std::process::exit(3);
     }
 
     Ok(())

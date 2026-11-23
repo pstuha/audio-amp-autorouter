@@ -12,9 +12,11 @@
 //! real enclosure. Those need a proper thermal stack-up.
 
 use crate::board::{Board, Footprint};
+use crate::router::RoutingResult;
+use serde::{Deserialize, Serialize};
 
 /// Heat source at a component.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HeatSource {
     /// Component reference.
     pub refdes: String,
@@ -28,7 +30,7 @@ pub struct HeatSource {
 }
 
 /// A solved temperature field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ThermalField {
     pub cols: usize,
     pub rows: usize,
@@ -389,6 +391,88 @@ pub fn colour_for_rise(rise_c: f64) -> (u8, u8, u8) {
     stops[3].1
 }
 
+/// Transient thermal proxy: a first-order RC step response per hot part.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransientThermal {
+    /// Worst estimated junction temperature after a long full-power step.
+    pub peak_junction_c: f64,
+    /// Dominant time constant in seconds.
+    pub time_constant_s: f64,
+    /// Time to reach 99% of the final rise (5 τ).
+    pub settling_s: f64,
+    /// Fraction of the board area covered by routed copper.
+    pub copper_coverage: f64,
+    /// Effective conductivity after accounting for that copper.
+    pub effective_conductivity: f64,
+    pub model: String,
+    pub confidence: String,
+    pub assumptions: Vec<String>,
+}
+
+/// Copper-covered fraction of the board, from the copper actually delivered.
+/// On two-layer boards both layers contribute (vias tie them thermally).
+pub fn copper_coverage(board: &Board, routing: Option<&RoutingResult>) -> f64 {
+    let Some(routing) = routing else { return 0.0 };
+    let area_mm2 = (board.width_mm * board.height_mm).max(1.0);
+    let copper_mm2: f64 = routing
+        .segments
+        .iter()
+        // Both layers are counted: vias (or the laminate) tie them thermally.
+        .map(|s| s.length_mm() * s.width_mm)
+        .sum();
+    (copper_mm2 / area_mm2).clamp(0.0, 1.0)
+}
+
+/// Solve a transient step response from the steady-state field and the
+/// delivered copper. This is a lumped proxy, not a FEM/CFD transient.
+pub fn solve_transient(
+    board: &Board,
+    sources: &[HeatSource],
+    routing: Option<&RoutingResult>,
+    params: &ThermalParams,
+    peak_board_rise_c: f64,
+) -> TransientThermal {
+    let coverage = copper_coverage(board, routing);
+    // Copper adds a near-linear in-plane heat path to the laminate.
+    let effective_k = params.conductivity * (1.0 + 2.0 * coverage);
+    let mut worst_tau = 0.0_f64;
+    let mut worst_junction = params.ambient_c + peak_board_rise_c;
+    for src in sources {
+        if src.power_w <= 0.0 {
+            continue;
+        }
+        let radius_m = (src.spread_mm.max(1.0) / 1000.0).max(1e-3);
+        let area_m2 = std::f64::consts::PI * radius_m * radius_m;
+        let thickness_m = (params.thickness_mm / 1000.0).max(1e-4);
+        let to_board = effective_k * area_m2 / thickness_m;
+        let to_air = params.surface_loss * 2.0 * area_m2;
+        let r_th = 1.0 / (to_board + to_air).max(1e-9);
+        // FR-4 volumetric heat capacity ≈ 1.9e6 J/(m³·K).
+        let c_th = 1.9e6 * area_m2 * thickness_m;
+        let tau = r_th * c_th;
+        worst_tau = worst_tau.max(tau);
+        // Board-coupled sources sit on their leads; tabbed packages keep a
+        // larger junction-to-board drop because the heatsink carries most heat.
+        let junction_factor = if src.spread_mm >= 10.0 { 1.15 } else { 1.05 };
+        let junction = params.ambient_c + peak_board_rise_c * junction_factor;
+        worst_junction = worst_junction.max(junction);
+    }
+    TransientThermal {
+        peak_junction_c: worst_junction,
+        time_constant_s: worst_tau,
+        settling_s: 5.0 * worst_tau,
+        copper_coverage: coverage,
+        effective_conductivity: effective_k,
+        model: "proxy".into(),
+        confidence: "low".into(),
+        assumptions: vec![
+            "lumped first-order RC per heat source".into(),
+            "FR-4 volumetric heat capacity 1.9e6 J/(m3 K)".into(),
+            "junction estimate uses a package factor, not a datasheet Rth".into(),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +594,43 @@ mod tests {
         // Out-of-range coordinates must not panic.
         let _ = field.rise_at(-50.0, -50.0);
         let _ = field.rise_at(5000.0, 5000.0);
+    }
+
+    #[test]
+    fn transient_report_uses_routed_copper_and_is_causal() {
+        let board = Board::new("thermal-transient", 60.0, 40.0, LutPreset::reliable());
+        let sources = vec![HeatSource {
+            refdes: "Q1".into(),
+            x: 20.0,
+            y: 20.0,
+            power_w: 2.0,
+            spread_mm: 5.0,
+        }];
+        let params = ThermalParams::default();
+        let field = solve(&board, &sources, &params);
+        let transient = solve_transient(
+            &board,
+            &sources,
+            None,
+            &params,
+            field.peak_rise_c as f64,
+        );
+        assert!(transient.time_constant_s > 0.0);
+        assert!(transient.settling_s > transient.time_constant_s);
+        assert!(transient.peak_junction_c > params.ambient_c);
+        assert_eq!(transient.model, "proxy");
+
+        let mut routing = RoutingResult::new();
+        routing.segments.push(crate::router::RouteSegment::new(
+            0.0, 0.0, 50.0, 0.0, "N", crate::board::NetClass::Power,
+        ));
+        let with_copper = solve_transient(
+            &board,
+            &sources,
+            Some(&routing),
+            &params,
+            field.peak_rise_c as f64,
+        );
+        assert!(with_copper.effective_conductivity > transient.effective_conductivity);
     }
 }

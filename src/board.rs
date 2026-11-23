@@ -186,6 +186,9 @@ pub struct Footprint {
     pub width_mm: f64,
     pub height_mm: f64,
     pub pads: Vec<Pad>,
+    /// Placement rotation in degrees; 0 is the unrotated default (module 3).
+    #[serde(default)]
+    pub rotation_deg: f64,
 }
 
 impl Footprint {
@@ -199,6 +202,7 @@ impl Footprint {
             width_mm: w,
             height_mm: h,
             pads: vec![Pad::new(w / 2.0, h / 2.0, 1.8, 0.9)],
+            rotation_deg: 0.0,
         }
     }
 
@@ -207,28 +211,67 @@ impl Footprint {
         self
     }
 
-    /// World position of pad `index`.
+    /// Place the footprint rotated to `rotation_deg` degrees.
+    pub fn with_rotation(mut self, rotation_deg: f64) -> Self {
+        self.rotation_deg = rotation_deg;
+        self
+    }
+
+    /// Rotate a local offset around the footprint centre.
+    fn rotate_offset(&self, dx: f64, dy: f64) -> (f64, f64) {
+        let r = self.rotation_deg.to_radians();
+        let (c, s) = (r.cos(), r.sin());
+        // KiCad's convention: positive angle is counter-clockwise on screen
+        // while the file's Y axis points down.
+        (dx * c + dy * s, -dx * s + dy * c)
+    }
+
+    /// Inverse of [`Footprint::rotate_offset`].
+    fn unrotate_offset(&self, dx: f64, dy: f64) -> (f64, f64) {
+        let r = self.rotation_deg.to_radians();
+        let (c, s) = (r.cos(), r.sin());
+        (dx * c - dy * s, dx * s + dy * c)
+    }
+
+    /// World position of pad `index`, with the footprint rotation applied.
     pub fn pad_world(&self, index: usize) -> Option<(f64, f64)> {
-        self.pads.get(index).map(|p| (self.x + p.x, self.y + p.y))
+        self.pads.get(index).map(|p| {
+            let (cx, cy) = self.center();
+            let (dx, dy) = self.rotate_offset(
+                p.x - self.width_mm / 2.0,
+                p.y - self.height_mm / 2.0,
+            );
+            (cx + dx, cy + dy)
+        })
     }
 
     pub fn center(&self) -> (f64, f64) {
         (self.x + self.width_mm / 2.0, self.y + self.height_mm / 2.0)
     }
 
-    /// Axis-aligned bounding box as `(x0, y0, x1, y1)`.
+    /// Axis-aligned bounding box of the rotated footprint.
     pub fn rect(&self) -> (f64, f64, f64, f64) {
-        (
-            self.x,
-            self.y,
-            self.x + self.width_mm,
-            self.y + self.height_mm,
-        )
+        let (cx, cy) = self.center();
+        let hw = self.width_mm / 2.0;
+        let hh = self.height_mm / 2.0;
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for (dx, dy) in [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)] {
+            let (x, y) = self.rotate_offset(dx, dy);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        (cx + min_x, cy + min_y, cx + max_x, cy + max_y)
     }
 
     pub fn contains(&self, px: f64, py: f64) -> bool {
-        let (x0, y0, x1, y1) = self.rect();
-        px >= x0 && px <= x1 && py >= y0 && py <= y1
+        let (cx, cy) = self.center();
+        let (dx, dy) = self.unrotate_offset(px - cx, py - cy);
+        dx.abs() <= self.width_mm / 2.0 && dy.abs() <= self.height_mm / 2.0
     }
 }
 
@@ -304,6 +347,10 @@ pub struct Board {
     /// One-line description shown in the board picker.
     #[serde(default)]
     pub description: String,
+    /// Two-layer board: copper may live on F.Cu and B.Cu and be joined by
+    /// plated vias. Single-layer LUT boards keep the default `false`.
+    #[serde(default)]
+    pub two_layer: bool,
 }
 
 impl Board {
@@ -317,7 +364,14 @@ impl Board {
             nets: Vec::new(),
             mounting_holes: Vec::new(),
             description: String::new(),
+            two_layer: false,
         }
+    }
+
+    /// Turn this into a two-layer board (with plated vias allowed).
+    pub fn with_two_layer(mut self) -> Self {
+        self.two_layer = true;
+        self
     }
 
     pub fn add_footprint(&mut self, fp: Footprint) {
@@ -372,7 +426,7 @@ impl Board {
                     .iter()
                     .find(|n| n.nodes.iter().any(|r| r.refdes == fp.refdes && r.pad == i))
                     .map(|n| n.name.clone());
-                out.push(((fp.x + pad.x, fp.y + pad.y), pad.size_mm, owner));
+                out.push((fp.pad_world(i).unwrap_or((fp.x + pad.x, fp.y + pad.y)), pad.size_mm, owner));
             }
         }
         out
@@ -636,6 +690,21 @@ mod tests {
         assert_eq!(fp.rect(), (5.0, 6.0, 15.0, 14.0));
         assert!(fp.contains(10.0, 10.0));
         assert!(!fp.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn footprint_rotation_moves_pads_and_bounding_box() {
+        // Footprint centred at (10, 10), 8 × 4 mm, pads at both long ends.
+        let fp = Footprint::new("R1", "r", NetClass::Signal, 6.0, 8.0, 8.0, 4.0)
+            .with_pads(vec![Pad::new(0.0, 2.0, 1.8, 0.9), Pad::new(8.0, 2.0, 1.8, 0.9)])
+            .with_rotation(90.0);
+        let (x0, y0) = fp.pad_world(0).expect("pad 0");
+        let (x1, y1) = fp.pad_world(1).expect("pad 1");
+        assert!((x0 - 10.0).abs() < 1e-9 && (y0 - 14.0).abs() < 1e-9);
+        assert!((x1 - 10.0).abs() < 1e-9 && (y1 - 6.0).abs() < 1e-9);
+        assert_eq!(fp.rect(), (8.0, 6.0, 12.0, 14.0));
+        assert!(fp.contains(10.0, 10.0));
+        assert!(!fp.contains(6.0, 8.0));
     }
 
     #[test]

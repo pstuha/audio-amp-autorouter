@@ -187,14 +187,33 @@ pub fn to_kicad_pcb(board: &Board, result: &RoutingResult, _fab: &FabOptions) ->
             .unwrap_or(0);
         let _ = writeln!(
             s,
-            "  (segment (start {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"F.Cu\") (net {}) (uuid \"{}\"))",
+            "  (segment (start {:.4} {:.4}) (end {:.4} {:.4}) (width {:.4}) (layer \"{}\") (net {}) (uuid \"{}\"))",
             seg.x1_mm,
             seg.y1_mm,
             seg.x2_mm,
             seg.y2_mm,
             seg.width_mm,
+            seg.layer.kicad_name(),
             net,
             uuid_for("seg", i)
+        );
+    }
+    for (i, via) in result.via_objects.iter().enumerate() {
+        let net = board
+            .nets
+            .iter()
+            .position(|n| n.name == via.net)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let _ = writeln!(
+            s,
+            "  (via (at {:.4} {:.4}) (size {:.4}) (drill {:.4}) (layers \"F.Cu\" \"B.Cu\") (net {}) (uuid \"{}\"))",
+            via.x_mm,
+            via.y_mm,
+            via.diameter_mm,
+            via.drill_mm,
+            net,
+            uuid_for("via", i)
         );
     }
 
@@ -208,27 +227,62 @@ fn write_footprint(s: &mut String, board: &Board, fp: &Footprint, index: usize) 
     let _ = writeln!(s, "  (footprint \"{}\"", escape(&fp_name(&fp.value)));
     let _ = writeln!(s, "    (layer \"F.Cu\")");
     let _ = writeln!(s, "    (uuid \"{}\")", uuid_for(&fp.refdes, index));
-    let _ = writeln!(s, "    (at {:.4} {:.4})", fp.x, fp.y);
+    // Module 3 places some footprints rotated. KiCad treats `(at x y)` as the
+    // footprint anchor and rotates the pad offsets around it, while the model
+    // stores the unrotated bounding-box top-left. For rotated parts the anchor
+    // is therefore the centre and pad offsets are relative to it; unrotated
+    // parts keep the original, byte-identical form.
+    let rotated = fp.rotation_deg.abs() > 1e-9;
+    let (anchor_x, anchor_y) = if rotated {
+        (fp.x + fp.width_mm / 2.0, fp.y + fp.height_mm / 2.0)
+    } else {
+        (fp.x, fp.y)
+    };
+    let local = |pad: &crate::board::Pad| {
+        if rotated {
+            (pad.x - fp.width_mm / 2.0, pad.y - fp.height_mm / 2.0)
+        } else {
+            (pad.x, pad.y)
+        }
+    };
+    let at = if rotated {
+        format!("{:.4} {:.4} {:.4}", anchor_x, anchor_y, fp.rotation_deg)
+    } else {
+        format!("{:.4} {:.4}", anchor_x, anchor_y)
+    };
+    let _ = writeln!(s, "    (at {at})");
 
     // Reference and value on the fabrication layer. Nothing goes on the
     // silkscreen: this model knows pads and a bounding box, not the artwork of
     // the real part, so a drawn outline would be decoration the DRC rightly
     // rejects where it crosses pads.
+    let ref_x = if rotated { 0.0 } else { fp.width_mm / 2.0 };
+    let ref_y = if rotated {
+        -fp.height_mm / 2.0 - 1.8
+    } else {
+        -1.8
+    };
     let _ = writeln!(
         s,
-        "    (property \"Reference\" \"{}\" (at {:.4} -1.8 0) (layer \"F.Fab\") (uuid \"{}\")",
+        "    (property \"Reference\" \"{}\" (at {:.4} {:.4} 0) (layer \"F.Fab\") (uuid \"{}\")",
         escape(&fp.refdes),
-        fp.width_mm / 2.0,
+        ref_x,
+        ref_y,
         uuid_for(&format!("{}ref", fp.refdes), index)
     );
     let _ = writeln!(s, "      (effects (font (size 1 1) (thickness 0.15)))");
     let _ = writeln!(s, "    )");
+    let val_y = if rotated {
+        fp.height_mm / 2.0 + 1.8
+    } else {
+        fp.height_mm + 1.8
+    };
     let _ = writeln!(
         s,
         "    (property \"Value\" \"{}\" (at {:.4} {:.4} 0) (layer \"F.Fab\") (uuid \"{}\")",
         escape(&fp.value),
-        fp.width_mm / 2.0,
-        fp.height_mm + 1.8,
+        ref_x,
+        val_y,
         uuid_for(&format!("{}val", fp.refdes), index)
     );
     let _ = writeln!(s, "      (effects (font (size 1 1) (thickness 0.15)))");
@@ -239,7 +293,23 @@ fn write_footprint(s: &mut String, board: &Board, fp: &Footprint, index: usize) 
     // would claim board area the part does not occupy, and KiCad then reports
     // overlaps with neighbours and with mounting holes that are in fact clear
     // of all copper.
-    let (cx0, cy0, cx1, cy1) = pad_bounds(fp);
+    let (cx0, cy0, cx1, cy1) = if rotated {
+        let mut x0 = f64::MAX;
+        let mut y0 = f64::MAX;
+        let mut x1 = f64::MIN;
+        let mut y1 = f64::MIN;
+        for pad in &fp.pads {
+            let (px, py) = local(pad);
+            let r = pad.size_mm / 2.0;
+            x0 = x0.min(px - r);
+            y0 = y0.min(py - r);
+            x1 = x1.max(px + r);
+            y1 = y1.max(py + r);
+        }
+        (x0 - 0.25, y0 - 0.25, x1 + 0.25, y1 + 0.25)
+    } else {
+        pad_bounds(fp)
+    };
     let _ = writeln!(
         s,
         "    (fp_rect (start {:.4} {:.4}) (end {:.4} {:.4})",
@@ -273,8 +343,8 @@ fn write_footprint(s: &mut String, board: &Board, fp: &Footprint, index: usize) 
             s,
             "    (pad \"{}\" thru_hole circle (at {:.4} {:.4}) (size {:.4} {:.4}) (drill {:.4}) (layers \"*.Cu\" \"*.Mask\"){} (uuid \"{}\"))",
             pi + 1,
-            pad.x,
-            pad.y,
+            local(pad).0,
+            local(pad).1,
             pad.size_mm,
             pad.size_mm,
             pad.drill_mm,

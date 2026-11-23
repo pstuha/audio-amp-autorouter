@@ -1,80 +1,126 @@
-# AmpRoute Studio
+# AmpRoute Studio 2.0
 
-Autorouter and 2-D board viewer for **single-layer LUT** (laser-iron / toner-transfer)
-audio amplifier PCBs.
+**Agent-first autorouter and 2-D board editor for LUT audio-amplifier PCBs.**
 
-![AmpRoute Studio](docs/screenshot.png)
+An AI agent invents a circuit and describes a board; AmpRoute turns it into a
+DRC-clean, manufacturable PCB with Gerbers, a 1:1 toner-transfer template and
+official CAM files. A human opens the same board in a familiar KiCad-like
+editor. No KiCad plugin, no Python runtime, no external services.
 
-Double-click the executable and the board opens. No console, no command line.
+![AmpRoute Studio routed LM386 board](docs/screenshot.png)
 
-This is a **standalone program**, not a KiCad plugin. It reads and writes
-`.kicad_pcb` files, so it fits into a KiCad workflow without being installed
-into KiCad.
+---
+
+## 60-second start
+
+```powershell
+cargo build --release           # target\release\amproute-studio.exe
+.\target\release\amproute-studio.exe
+```
+
+GUI: **Open board…** → pick `.kicad_pcb` or JSON → **F5** → choose
+**Export folder…** → **Ctrl+E**. No board is preloaded: the shipped amplifiers
+are test fixtures, not presets.
+
+Headless:
+
+```powershell
+# Route one of the five shipped test boards
+.\amproute-studio.exe --cli --board lm386-mini -o out --json
+
+# Route an agent-designed board
+.\amproute-studio.exe --cli -i my_board.json -o out --json
+
+# Two-layer variant with plated vias
+.\amproute-studio.exe --cli -i my_board.json --two-layer -o out2 --json
+
+# Official CAM formats (from KiCad's own exporters)
+.\amproute-studio.exe --cli -i my_board.json --odb --ipc -o cam
+
+# Machine-readable agent interface
+cargo build --release --bin amproute-mcp
+```
+
+Exit codes: `0` success, `2` invalid board, `3` routing/export refused.
 
 ---
 
 ## What it does
 
-| Stage | Feature |
-|-------|---------|
-| **Boards** | Five built-in test amplifiers from 45 × 35 mm to 170 × 110 mm, plus any board you load: `.kicad_pcb` or the program's own JSON. |
-| **Routing** | Grid A\* with audio net classes, exact-millimetre clearance, per-segment track width. Thermal and star-ground keep-outs bias paths away. Rip-up and reroute when a net is boxed in. |
-| **Thermal** | A real steady-state 2-D conduction + convection solve, drawn as a heatmap. Not decorative blobs. |
-| **Checks** | Rejects pads wired to two nets (shorts), dangling pad references, footprints outside the outline, geometry below the LUT preset. |
-| **Export** | Gerber (RS-274X), SVG preview, PDF report, a **1:1 LUT print template**, and a **`.kicad_pcb`** you can open in KiCad. |
+| Stage | Implementation |
+|-------|----------------|
+| **Import** | `.kicad_pcb` and AmpRoute JSON; rotates footprints correctly; reports every skipped KiCad feature. |
+| **Rules** | `R01`–`R11`: LUT feature band, vias, width, clearance, net class, acute corners, parallel runs, annular ring, drill, edge clearance. |
+| **Placement** | Opt-in 180° footprint optimizer (`--optimize-placement`, MCP `optimize_placement`). |
+| **Routing** | 8-connected/octile A* with exact-mm `Occupancy`, audio proximity penalties, star-ground and thermal zones, rip-up/reroute, line-of-sight simplification, 45° canonicalisation and LUT width taper. |
+| **Verification** | Own audit + `kicad-cli pcb drc --severity-all`; 15 reference boards at 100 % routing with zero violations. |
+| **Quality** | DC drop, I²R, IPC-2221 width, linear AC (MNA), EMI/crosstalk proxies, transient thermal — all versioned JSON. |
+| **Export** | Gerber, SVG, PDF, 1:1 LUT template (front and mirrored back), `.kicad_pcb`, Excellon drill, IPC-2581 Rev C, ODB++ zip. |
+| **Agents** | CLI `--json` (one document on stdout) and MCP JSON-RPC 2.0 over stdio. |
 
-### The five test boards
+### Agent workflow
 
-Each is the **left channel** of a stereo amplifier — enough to prove the router
-copes with different topologies and sizes.
+1. Agent creates a board (JSON or `.kicad_pcb`) — no GUI needed.
+2. `route_board` validates, routes, audits and writes every deliverable.
+3. `get_result` returns nets, DRC, measurements, quality verdict and exact file paths.
+4. Human prints `lut_print.pdf` at 100 %, transfers toner, etches and solders.
 
-| Board | Size | Stage |
-|-------|------|-------|
-| `lm386-mini` | 45 × 35 mm | LM386 single chip |
-| `tda2030-compact` | 70 × 50 mm | TDA2030 power IC, split supply |
-| `cmoy-headphone` | 80 × 50 mm | NE5532 headphone amp, virtual ground |
-| `classic-ltp` | 130 × 90 mm | Class-AB LTP + VAS + triple output |
-| `twin-pair-200` | 170 × 110 mm | Dual-pair discrete output |
+Ten agent-designed boards are built in (`pam8403-mini`, `lm358-preamp`,
+`tda2822-bridge`, `ne555-tone`, `classa-single`, `jfet-buffer`,
+`discrete-opamp`, `lm1875-mono`, `ta2024-tripath`, `hybrid-output`) alongside
+five shipped fixtures (`lm386-mini`, `tda2030-compact`, `cmoy-headphone`,
+`classic-ltp`, `twin-pair-200`). All 15 route 100 % with KiCad DRC clean.
 
-All five follow the same physical rules: mounting holes in the corners with a
-copper keep-out, copper clear of the board edge, every pad on exactly one net,
-input nets kept away from output and power nets.
+### Audio-specific routing
 
-Every exported board passes KiCad's own DRC with **zero violations**
-(`kicad-cli pcb drc --severity-all`). The routed results are checked into
-[`boards/`](boards/) as `.kicad_pcb` files, one per test board, so you can open
-any of them in KiCad without building or running anything:
+- Net classes set width, priority and routing cost (GND/PWR first, sensitive
+  inputs short and direct).
+- Input↔Power/Output proximity penalty ×10; Feedback↔Output/Power ×5.
+- Star-ground bias (`board.rs::star_ground_point`) and thermal hotspot keep-outs.
+- Single-layer LUT by default: vias forbidden, insulated-wire jumpers instead.
+- Two-layer mode adds plated vias, B.Cu Gerber, mirrored B.Cu LUT sheet and drill.
 
-```powershell
-kicad-cli pcb drc boards\classic_ltp.kicad_pcb --severity-all
-```
+---
 
-To route your own board, generate the same kind of file with the GUI (`Ctrl+K`)
-or the CLI, open it in KiCad's PCB editor, and check it with that project's own
-DRC.
+## GUI
 
-### GUI
+Familiar EDA layout: menu bar, toolbars, appearance/net/component tree, board
+canvas, inspector, DRC and statistics, status bar.
 
-- Pick a built-in board, or open your own `.kicad_pcb` / JSON.
-- Zoom with the wheel, pan by dragging.
-- Net list with live routing status and class colours.
-- Toggle copper, components, pads, grid, soft zones, and the thermal heatmap.
-- `F5` routes, `Ctrl+K` writes a `.kicad_pcb`, `Ctrl+E` exports the rest.
+- Zoom with the wheel, pan by drag, rotate with `R`/`Shift+R`, mirror with `F`.
+- Click a pad, track, component or net to inspect it.
+- Toggle layers, keep-outs and thermal heatmap.
+- `F5` route, `Esc` stop, `Ctrl+O` open, `Ctrl+K` KiCad export, `Ctrl+E` all exports.
+- Routing runs on a worker thread — the UI stays responsive.
 
-### Headless
+---
 
-```powershell
-# List the built-in boards
-.\AmpRoute-Studio.exe --list-boards
+## Machine interface
 
-# Route one of them and export everything
-.\AmpRoute-Studio.exe --cli --board classic-ltp --output my_out
+CLI `--json` prints exactly one `PipelineResult` JSON document; diagnostics go
+to stderr. MCP server:
 
-# Route your own board — KiCad PCB or the program's JSON
-.\AmpRoute-Studio.exe --cli --input my.kicad_pcb --output my_out --grid 0.5
-```
+| Tool | Purpose |
+|------|---------|
+| `get_capabilities`, `get_quality_schema` | API version, formats, analysis schema |
+| `list_boards`, `list_extra_boards` | Fixtures and agent designs |
+| `validate_board`, `run_drc` | Pre-flight checks |
+| `route_board`, `get_result` | Route, export and retrieve the full report |
+| `run_ac`, `generate_netlist`, `run_emi`, `run_thermal` | Proxy analyses |
+| `optimize_placement`, `set_lut_profile`, `suggest_jumpers` | Agent helpers |
 
-Exit codes: `0` success, `2` invalid board, `3` routing or export refused.
+Full contract: [`docs/agent-api.md`](docs/agent-api.md).
+
+### Quality verdict
+
+`quality` is separate from manufacturability. Hard gates: all nets routed,
+rules clean, own DRC clean, KiCad DRC clean, exports written. Electrical,
+AC, EMI and thermal verdicts gate `ok` only when the agent supplies data and
+selects them through `analysis_policy`. All proxy reports carry `model`,
+`confidence` and `assumptions`.
+
+History and comparisons: [`docs/quality-roadmap.md`](docs/quality-roadmap.md),
+[`docs/router-roadmap.md`](docs/router-roadmap.md).
 
 ---
 
@@ -82,49 +128,33 @@ Exit codes: `0` success, `2` invalid board, `3` routing or export refused.
 
 | File | Purpose |
 |------|---------|
-| `board.gbr` | Gerber RS-274X copper layer, format 4.6, millimetres. |
-| `board.svg` | Colour preview with per-net colours. |
-| `board.pdf` | Summary report with statistics. |
-| `lut_print.pdf` | 1:1 template for the iron-on transfer. Print at 100% — never "fit to page". |
-| `<board>.kicad_pcb` | The board as a KiCad project file: footprints, nets, pads, outline, mounting holes and the routed copper. |
+| `board.gbr`, `board_b.gbr` | RS-274X copper layers, 4.6 format, millimetres |
+| `board.svg` | Colour preview |
+| `board.pdf` | Route report |
+| `lut_print.pdf`, `lut_print_b.pdf` | 1:1 iron-on templates, front/mirrored back — print at 100 % |
+| `<board>.kicad_pcb` | KiCad project board |
+| `vias.drl` | Excellon drill for plated vias |
+| `jumpers.csv` | Insulated-wire jumper endpoints |
+| `board.xml` | IPC-2581 Rev C (KiCad exporter) |
+| `board_odb.zip` | ODB++ (KiCad exporter) |
 
 ---
 
-## Honest limitations
+## Verification
 
-This is a working engineering prototype, not a certified EDA tool. Read this
-before etching anything:
+```text
+cargo test
+  215 unit tests
+  5-board acceptance + 10-board acceptance
+  e2e, MCP, reference, quality, standards, SPICE golden
+  → 0 failures
 
-- **Single layer, through-hole only.** No vias, no double-layer routing.
-- **Import is deliberately partial.** Zones, vias, arcs on inner layers,
-  teardrops and custom pad shapes are reduced or skipped, and every skipped
-  feature is reported. Rotated footprints are read as 0°.
-- **The thermal model is not FEM or CFD.** It is a steady-state 2-D conduction
-  and convection solve on a ~2 mm grid. It answers "where does the heat go, and
-  which tracks run through hot areas", not "what is the junction temperature".
-  Devices bolted to a heatsink are modelled as coupling only a fraction of their
-  dissipation into the board.
-- **Not a manufacturing DRC.** The exported `.kicad_pcb` is checked with KiCad's
-  DRC, but annular rings, current capacity and edge clearance are not certified.
-- **Always open the generated Gerber in an independent viewer** (KiCad Gerber
-  Viewer, Gerbv) and verify scale, orientation and connectivity before production.
-
-The software refuses to write copper when validation fails or a net is
-unrouted — but that is a guard against obvious mistakes, not a guarantee.
-
----
-
-## Building from source
-
-Requires Rust 1.75 or newer.
-
-```bash
-cargo build --release      # target/release/amproute-studio.exe
-cargo test                 # 81 tests
+kicad-cli pcb drc --severity-all   # 0 violations on all 15 boards
+lm386-mini: 7/7 nets, non_canonical segments = 0
 ```
 
-On Linux, install the usual GUI development packages (`libxkbcommon`,
-`libwayland-dev`, `libgl1-mesa-dev`) for `eframe`.
+The golden SPICE test runs only when `AMPROUTE_NGSPICE` points to a simulator;
+otherwise it skips. KiCad 10 is used automatically for DRC and optional CAM.
 
 ---
 
@@ -132,28 +162,42 @@ On Linux, install the usual GUI development packages (`libxkbcommon`,
 
 ```
 src/
-  board.rs      Board model, net classes, LUT presets, validation
-  boards.rs     The five built-in test amplifier boards
-  sexpr.rs      Reader and writer for KiCad's S-expression format
-  import.rs     Load an existing .kicad_pcb into the model
-  kicad.rs      Write a .kicad_pcb that KiCad opens and checks
-  occupancy.rs  Exact-millimetre copper clearance and slack
-  router.rs     Grid A* router: audio costs, width taper, rip-up and reroute
-  thermal.rs    Steady-state conduction + convection solve
-  placement.rs  Auto-placement and placement checks
-  export.rs     Gerber / SVG / PDF / LUT template writers
-  gui.rs        egui desktop application
-  main.rs       Entry point: GUI by default, --cli for batch
-tests/          Integration tests
+  agent.rs, bin/amproute-mcp.rs   MCP/JSON agent interface
+  board.rs, boards.rs             Model, net classes, fixtures and agent designs
+  import.rs, sexpr.rs, kicad.rs   KiCad round-trip
+  router.rs, routing_engine.rs    A*, octile search, rip-up, canonicalisation
+  occupancy.rs, two_layer.rs      Exact clearance, layered completion
+  preroute.rs, jumper.rs          Star power/ground, insulated-wire jumpers
+  rules.rs, drc.rs                LUT rules and DRC
+  measure.rs, ac.rs, emi.rs       DC/AC/EMI quality proxies
+  thermal.rs                      2-D conduction + transient estimate
+  export.rs                       Gerber/SVG/PDF/LUT/CAM
+  gui.rs, main.rs                 egui editor and CLI
+tests/                             Acceptance and contract tests
+docs/                               Agent API and roadmaps
 ```
 
 ---
 
+## Limitations
+
+- Through-hole only; two-layer vias are supported in the tool but require a
+  manufactured two-layer board.
+- KiCad import is deliberately partial (no zones, teardrops or custom pads);
+  skipped features are reported.
+- Thermal is a 2-D/RC proxy, AC is linear MNA, EMI is geometric — none is a
+  full-wave or FEM solver.
+- Always verify scale/orientation in an independent Gerber viewer before fab.
+
+## Building
+
+Rust 1.75+. On Linux install `libxkbcommon`, `libwayland-dev`, `libgl1-mesa-dev`.
+
+```bash
+cargo build --release
+cargo test
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-Development followed the Russian-language technical specification supplied with
-the project (ТЗ): GUI with 2-D board view (3), auto-placement (3.1), PDF/Gerber/SVG
-export (4.4), star ground (5.1), input/power/output isolation (5.2), thermal
-awareness (5.3), and LUT presets (6).
