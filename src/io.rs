@@ -137,7 +137,7 @@ pub fn import_ses(text: &str) -> Result<SesImport> {
                             .filter_map(|a| a.parse::<f64>().ok())
                             .map(|v| v * scale)
                             .collect();
-                        for pair in coords.chunks_exact(2).collect::<Vec<_>>().windows(2) {
+                        for pair in coords.as_chunks::<2>().0.windows(2) {
                             let (x1, y1) = (pair[0][0], pair[0][1]);
                             let (x2, y2) = (pair[1][0], pair[1][1]);
                             if x1 == x2 && y1 == y2 {

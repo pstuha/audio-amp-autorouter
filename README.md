@@ -1,4 +1,4 @@
-# AmpRoute Studio 2.0
+# AmpRoute Studio 2.1.0
 
 **Agent-first autorouter and 2-D board editor for LUT audio-amplifier PCBs.**
 
@@ -90,6 +90,8 @@ canvas, inspector, DRC and statistics, status bar.
 - Zoom with the wheel, pan by drag, rotate with `R`/`Shift+R`, mirror with `F`.
 - Click a pad, track, component or net to inspect it.
 - Toggle layers, keep-outs and thermal heatmap.
+- Statistics: board totals (copper, segments, routed nets), track-width min / avg / max,
+  per-net table and thermal peak / average — **Copy stats** copies it to the clipboard.
 - `F5` route, `Esc` stop, `Ctrl+O` open, `Ctrl+K` KiCad export, `Ctrl+E` all exports.
 - Routing runs on a worker thread — the UI stays responsive.
 
@@ -118,6 +120,11 @@ rules clean, own DRC clean, KiCad DRC clean, exports written. Electrical,
 AC, EMI and thermal verdicts gate `ok` only when the agent supplies data and
 selects them through `analysis_policy`. All proxy reports carry `model`,
 `confidence` and `assumptions`.
+
+Honest verdicts: while currents are **assumed** (`assumed_currents: true`),
+electrical violations (M02 track width vs IPC-2221, M03 drop) are advisory;
+with real agent-supplied currents (`measure_currents`, `NetExcitation`) the
+same violations gate `ok`. `assumed_currents: false` in every `get_result`.
 
 History and comparisons: [`docs/quality-roadmap.md`](docs/quality-roadmap.md),
 [`docs/router-roadmap.md`](docs/router-roadmap.md).
@@ -188,6 +195,15 @@ docs/                               Agent API and roadmaps
 - Thermal is a 2-D/RC proxy, AC is linear MNA, EMI is geometric — none is a
   full-wave or FEM solver.
 - Always verify scale/orientation in an independent Gerber viewer before fab.
+
+---
+
+## Bench validation
+
+`scripts\bench_validate.ps1` routes all 15 boards and checks `result.ok`.
+Bench numbers (gain, THD at 1 kHz, junction temperature) are device-dependent:
+**bench validation of an amplifier is currently blocked — no physical bench is
+available in this environment.**
 
 ## Building
 

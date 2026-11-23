@@ -335,7 +335,7 @@ mod tests {
         let pre = preroute(&board);
         let vcc: Vec<&PreRouteTrace> =
             pre.traces.iter().filter(|t| t.net == "VCC").collect();
-        assert!(vcc.len() >= 1);
+        assert!(!vcc.is_empty());
         assert!(vcc.iter().all(|t| t.width_mm == 0.8 && t.net == "VCC"));
     }
 

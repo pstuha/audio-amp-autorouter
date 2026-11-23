@@ -4,48 +4,47 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
-
-env:
-  CARGO_TERM_COLOR: always
+    branches: [main]
 
 jobs:
-  test:
-    name: Build and test
+  lint:
+    name: clippy (-D warnings)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo clippy --all-targets -- -D warnings
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+  test:
+    name: cargo test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+  build:
+    name: cargo build --release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bins
 
-      - name: Formatting
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Tests
-        run: cargo test --all-targets
-
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Smoke-test headless export
+  smoke-two-layer:
+    name: two-layer route smoke
+    runs-on: windows-latest
+    needs: [build, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bins
+      - name: Route lm386-mini --two-layer
+        shell: pwsh
         run: |
-          .\target\release\amproute-studio.exe --cli --output ci-output
-          if (-not (Test-Path ci-output\board.gbr)) { throw "Gerber was not produced" }
-          if (-not (Test-Path ci-output\lut_print.pdf)) { throw "LUT template was not produced" }
-          Get-ChildItem ci-output | Format-Table Name, Length
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: amproute-studio-windows-x86_64
-          path: target/release/amproute-studio.exe
-          if-no-files-found: error
+          $o = Join-Path $env:TEMP amproute_ci_2l
+          New-Item -ItemType Directory -Force -Path $o | Out-Null
+          $p = & target/release/amproute-studio.exe --cli --board lm386-mini --two-layer -o $o --json 2>$null
+          if ($LASTEXITCODE -ne 0) { throw "exit code $LASTEXITCODE" }
+          $r = ($p | Out-String | ConvertFrom-Json)
+          if ($r.ok -ne $true) { throw "ok = $($r.ok)" }

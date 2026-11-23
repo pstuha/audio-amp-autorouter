@@ -4,6 +4,21 @@ All notable changes to AmpRoute Studio are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-11-23
+
+Minor release: CI workflow, honest quality verdicts, GUI statistics, MSRV fix.
+
+- GitHub Actions CI: `cargo test`, `clippy --all-targets -- -D warnings`,
+  `--release` build and a two-layer route smoke on every push to `main`.
+- `Cargo.toml`: `rust-version` corrected to **1.88** (deps require edition-2024;
+  verified `cargo +1.88 build` passes).
+- GUI: new **Statistics** panel in the left sidebar — copper totals, segments,
+  routed nets, track-width min/avg/max, per-net table, thermal peak/average,
+  **Copy stats** (clipboard).
+- Docs: quality verdict honesty — `assumed_currents` semantics; M02/M03 width
+  and drop violations advisory while assumed, hard gates with real currents;
+  README GUI section updated accordingly.
+
 ## [2.0.0] — 2026-11-23
 
 Major release: agent-first workflow, professional routing geometry and official CAM.

@@ -986,7 +986,7 @@ impl Router {
 
         while let Some(node) = open.pop() {
             expanded += 1;
-            if expanded % 2048 == 0 && self.out_of_time() {
+            if expanded.is_multiple_of(2048) && self.out_of_time() {
                 return None;
             }
             // Stale heap entry: a shorter route to this cell was already found.

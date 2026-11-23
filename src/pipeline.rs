@@ -527,28 +527,28 @@ pub fn run_pipeline(board: Board, config: PipelineConfig, out_dir: &str) -> Resu
     // currents it is advisory; with agent-supplied currents it becomes a hard
     // gate on `ok`, because then the numbers are real design constraints.
     let assumed_currents = config.measure_currents.is_none() && config.excitations.is_none();
-    let electrical_ok = measurements.as_ref().map_or(true, |m| {
+    let electrical_ok = measurements.as_ref().is_none_or(|m| {
         m.violations
             .iter()
             .all(|v| v.rule == MeasureRule::Temperature)
     });
-    let thermal_ok = measurements.as_ref().map_or(true, |m| {
+    let thermal_ok = measurements.as_ref().is_none_or(|m| {
         m.violations
             .iter()
             .all(|v| v.rule != MeasureRule::Temperature)
-    }) && transient.as_ref().map_or(true, |t| {
+    }) && transient.as_ref().is_none_or(|t| {
         (t.peak_junction_c - config.thermal_params.ambient_c)
             <= config.measure_config.copper.max_temp_rise_c
     });
     let ac_ok = ac_report
         .as_ref()
-        .map_or(true, |report| report.is_stable() && report.dc_gain_db.is_finite());
+        .is_none_or(|report| report.is_stable() && report.dc_gain_db.is_finite());
     let quality = QualityReport {
         assumed_currents,
         electrical_ok,
         thermal_ok,
         ac_ok,
-        emi_ok: emi_report.as_ref().map_or(true, |r| r.is_ok()),
+        emi_ok: emi_report.as_ref().is_none_or(|r| r.is_ok()),
         violations: measurements
             .as_ref()
             .map(|m| m.violations.iter().map(|v| v.to_string()).collect::<Vec<String>>())

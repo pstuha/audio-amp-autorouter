@@ -93,6 +93,11 @@ KiCad DRC (`drc.kicad_drc_ran`) clean, exports written. Raw routing geometry is
 also checked by `routing.post_rules` (LUT width/clearance, acute corners,
 parallel runs) before copper is shipped.
 
+Honest verdicts: `quality.assumed_currents` is `true` while currents are not
+supplied (`measure_currents` or `NetExcitation`). While assumed, the electrical
+and thermal verdicts are advisory and never block `ok`; with real supplied
+currents, M02/M03/M04-style violations become hard gates.
+
 Electrical/thermal quality is reported separately in `quality`:
 
 | Field | Meaning |

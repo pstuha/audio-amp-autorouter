@@ -166,6 +166,7 @@ KiCad DRC чист; однослойные эталоны не изменили�
   умолчанию + line-of-sight + разложение «последней мили» на 0°/45°/90° цепочки.
   DRC = 0, `kicad-cli` DRC запускался.
 - Релиз **2.0.0**: `git log -1` → `4665bd4` (main → origin/main), GitHub-описание обновлено.
+- Релиз **2.1.0**: GUI Statistics + CI + исправление `rust-version` на 1.88 (проверено `cargo +1.88 build`); clippy `--all-targets -D warnings` чист.
 
 ## CAM-форматы и перемычки: финальное решение
 

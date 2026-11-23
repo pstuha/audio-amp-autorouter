@@ -436,7 +436,7 @@ impl RoutingEngine {
         let mut tried = 0usize;
 
         for order in &orders {
-            if best.is_some() && best.as_ref().map_or(true, |(r, _)| r.failed_nets.is_empty()) {
+            if best.is_some() && best.as_ref().is_none_or(|(r, _)| r.failed_nets.is_empty()) {
                 break;
             }
             tried += 1;

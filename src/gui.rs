@@ -122,6 +122,24 @@ pub struct AmpRouteApp {
     canvas_size: Vec2,
 }
 
+/// Per-net summary row for the GUI statistics panel.
+struct StatsRow {
+    name: String,
+    length_mm: f64,
+    segments: usize,
+    width_min: f64,
+}
+
+/// Board totals for the GUI statistics panel.
+struct BoardStats {
+    copper_mm: f64,
+    segments: usize,
+    widths: Option<(f64, f64, f64)>,
+    routed: usize,
+    total: usize,
+    nets: Vec<StatsRow>,
+}
+
 impl Default for Appearance {
     fn default() -> Self {
         Self {
@@ -628,6 +646,45 @@ impl AmpRouteApp {
         );
     }
 
+    fn stats(&self) -> BoardStats {
+        let mut map: std::collections::BTreeMap<String, (f64, usize, f64, f64, f64)> =
+            Default::default();
+        for seg in &self.copper.segments {
+            let e = map.entry(seg.net.clone()).or_insert((0.0, 0, f64::MAX, 0.0, f64::MIN));
+            e.0 += seg.length_mm();
+            e.1 += 1;
+            e.2 = e.2.min(seg.width_mm);
+            e.3 += seg.width_mm;
+            e.4 = e.4.max(seg.width_mm);
+        }
+        let segments: usize = map.values().map(|v| v.1).sum();
+        let widths = if segments == 0 {
+            None
+        } else {
+            let min = map.values().map(|v| v.2).fold(f64::MAX, f64::min);
+            let max = map.values().map(|v| v.4).fold(f64::MIN, f64::max);
+            Some((min, map.values().map(|v| v.3).sum::<f64>() / segments as f64, max))
+        };
+        let mut nets: Vec<StatsRow> = map
+            .iter()
+            .map(|(name, v)| StatsRow {
+                name: name.clone(),
+                length_mm: v.0,
+                segments: v.1,
+                width_min: v.2,
+            })
+            .collect();
+        nets.sort_by(|a, b| b.length_mm.total_cmp(&a.length_mm));
+        BoardStats {
+            copper_mm: nets.iter().map(|n| n.length_mm).sum(),
+            segments,
+            widths,
+            routed: self.copper.routed_nets.len(),
+            total: self.board.nets.len(),
+            nets,
+        }
+    }
+
     fn draw_heatmap(&self, painter: &egui::Painter, rect: Rect, field: &ThermalField) {
         if field.peak_rise_c <= 0.0 {
             return;
@@ -940,6 +997,52 @@ impl AmpRouteApp {
             ui.label(RichText::new(format!("{} × {} mm", self.board.width_mm, self.board.height_mm)).small());
 
             ui.separator();
+            ui.heading("Statistics");
+            let stats = self.stats();
+            ui.label(RichText::new(format!(
+                "Copper {:.1} mm · segments {} · routed {}/{}",
+                stats.copper_mm, stats.segments, stats.routed, stats.total
+            )).small());
+            if let Some((min_w, avg_w, max_w)) = stats.widths {
+                ui.label(RichText::new(format!(
+                    "Track width min {:.2} / avg {:.2} / max {:.2} mm",
+                    min_w, avg_w, max_w
+                )).small());
+            }
+            if let Some(field) = &self.thermal_field {
+                let avg_c = if field.temps.is_empty() {
+                    0.0
+                } else {
+                    field.temps.iter().sum::<f32>() as f64 / field.temps.len() as f64
+                };
+                ui.label(RichText::new(format!(
+                    "Thermal peak {:.1} °C · average {:.1} °C · ambient {:.1} °C",
+                    field.peak_rise_c, avg_c, field.ambient_c
+                )).small());
+            }
+            egui::ScrollArea::vertical().id_salt("stats").max_height(140.0).show(ui, |ui| {
+                for row in &stats.nets {
+                    ui.label(format!(
+                        "{}  {:.1} mm · {} seg · {:.2} mm",
+                        row.name, row.length_mm, row.segments, row.width_min
+                    ));
+                }
+            });
+            if ui.button("Copy stats").clicked() {
+                let mut text = format!(
+                    "Copper {:.1} mm · segments {} · routed {}/{}",
+                    stats.copper_mm, stats.segments, stats.routed, stats.total
+                );
+                for row in &stats.nets {
+                    text.push_str(&format!(
+                        "\n{}  {:.1} mm · {} seg · {:.2} mm",
+                        row.name, row.length_mm, row.segments, row.width_min
+                    ));
+                }
+                ctx.copy_text(text);
+            }
+
+            ui.separator();
             ui.heading("Export");
             let dir = self.output_dir();
             ui.label(RichText::new(dir.display().to_string()).small());
@@ -1152,8 +1255,8 @@ impl AmpRouteApp {
             match dialog {
                 Dialog::About => {
                     egui::Window::new("About AmpRoute Studio").collapsible(false).resizable(false).show(ctx, |ui| {
-                        ui.label("AmpRoute Studio 2.0 — agent-first autorouter and 2-D board editor.");
-                        ui.label("15 reference boards · 100% routing · zero KiCad DRC violations.");
+                        ui.label("AmpRoute Studio 2.1.0 — agent-first autorouter and 2-D board editor.");
+                        ui.label("Statistics panel, 15 reference boards · 100% routing · zero KiCad DRC violations.");
                         ui.label("LUT Gerber/1:1 template, IPC-2581, ODB++, CLI --json, MCP stdio.");
                         ui.label("MIT license · Rust + egui · github.com/pstuha/audio-amp-autorouter");
                         if ui.button("Close").clicked() { close = true; }

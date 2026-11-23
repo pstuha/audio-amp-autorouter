@@ -163,7 +163,7 @@ pub struct AcReport {
 
 impl AcReport {
     pub fn is_stable(&self) -> bool {
-        self.phase_margin_deg.map_or(true, |m| m > 30.0)
+        self.phase_margin_deg.is_none_or(|m| m > 30.0)
     }
 }
 

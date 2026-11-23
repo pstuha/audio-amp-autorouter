@@ -36,4 +36,4 @@ if ($fail) {
     exit 1
 }
 Write-Host "Bench acceptance: all boards ok"
-Write-Host "Next: bench meter — gain, THD (1 kHz), junction temperature of the boards."
+Write-Host "Next: bench meter - gain, THD (1 kHz), junction temperature of the boards."

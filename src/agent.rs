@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(response["result"]["board"], "LM386 Mini");
         let full = call(&mut service, "get_result", 6);
         assert_eq!(full["board_name"], "LM386 Mini");
-        assert!(full["final_copper"]["segments"].as_array().unwrap().len() > 0);
+        assert!(!full["final_copper"]["segments"].as_array().unwrap().is_empty());
     }
 
     #[test]
